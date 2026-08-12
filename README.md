@@ -45,13 +45,19 @@ W3C DTCG motion tokens compiled to CSS, JS and Tailwind, with a component utilit
 
 Four AI advisors, each answering inside a sealed context window, genuinely blind to each other, so they cannot converge into one agreeable voice. They are built to disagree. The Operator refuses to think past eight weeks. The Capital Allocator refuses to think inside them. When they split, the split is the part worth reading.
 
-**Also shipped:** [ProjectYou](https://projectyou.app), a Qur'an-centric life OS, and a CMS I built and still run.
+**Also shipped:** [ProjectYou](https://projectyou.app), a Qur'an-centric life OS, a CMS I built and still run, and the Itqan CRM, which is a Next.js portal with a self-hosted Supabase behind it and an iOS app in front of it.
+
+The iOS app is deliberately a WebView around the portal, so every deploy reaches the phone without waiting on App Review. The native layer only does what a WebView genuinely cannot: push with deep links pinned to the portal origin, a Face ID lock, a share extension in Swift, and an offline write queue that replays through the page rather than natively, because React Native's fetch does not carry the WebView's session and a queue that silently 401s is worse than no queue at all. I learned that one from a review board, not from a user, which was lucky.
 
 ## Stack
 
-[![Stack](https://skillicons.dev/icons?i=ts,py,react,nextjs,tailwind,nodejs,postgres,supabase,docker,aws,vercel,figma)](https://skillicons.dev)
+[![Stack](https://skillicons.dev/icons?i=ts,py,swift,react,nextjs,tailwind,nodejs,postgres,supabase,docker,terraform,aws,githubactions,figma)](https://skillicons.dev)
 
-Claude Code is where most of the day happens. Docker for anything with more than one moving part, Supabase for hosted Postgres, GitHub for everything else. AWS is the one I am learning in public right now, which mostly means posting the parts that break before I know why.
+Claude Code is where most of the day happens. Docker for anything with more than one moving part, Supabase for hosted Postgres, GitHub for everything else.
+
+AWS stopped being the thing I was learning in public somewhere during the migration off Vercel and Netlify. Both Itqan properties now run on one EC2 box under Coolify with self-hosted Supabase beside them, and the estate is described in Terraform instead of in my memory of what I clicked. Route 53 health checks, CloudWatch alarms in us-east-1 because that is the only region the metric exists in, scheduled AMIs, SSM instead of SSH.
+
+The most useful thing I learned there was not a service. I found a backup policy that had been sitting in ERROR for forty-five days. It was not switched off, it was broken, and broken looked exactly like working right up until I went and read the status. The only symptom was an absence, and nobody checks an absence. Everything I build now assumes that.
 
 ## Itqan
 
