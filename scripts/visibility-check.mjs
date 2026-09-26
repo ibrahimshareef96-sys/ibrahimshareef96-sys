@@ -16,10 +16,15 @@
  *                          telling engines about changes, not a daily blast.
  *   VISIBILITY_ORIGINS     JSON map of host -> origin, to point the check at a
  *                          local build, e.g. {"shareefi.co":"http://localhost:3012"}.
- *                          Redirect checks are skipped for overridden hosts.
+ *                          Redirect checks are skipped for overridden hosts, and
+ *                          so is the IndexNow submit: a local build is never
+ *                          announced to the live service. Override
+ *                          api.indexnow.org too to run the submit against a stub.
  *
- * Levels: FAIL = crawlers are blocked or misled (exits 1). WARN = a signal is
- * missing or weak (reported, does not fail the run).
+ * Levels: FAIL = crawlers are blocked or misled. WARN = a signal is missing or
+ * weak. Both fail the run (exit 1), except the warnings in ACCEPTED_WARNINGS:
+ * GitHub only notifies on a failed run, so a warning on a green run reaches
+ * nobody. The report lists the accepted warnings and why each is accepted.
  */
 
 import { appendFileSync } from "node:fs";
@@ -79,13 +84,27 @@ const CRAWLERS = [
 ];
 
 const SITEMAP_SAMPLE = 12;
-const TIMEOUT_MS = 20_000;
+// Per request. Requests run one after another (about 25 per site), so this
+// bounds even a slow site at a few minutes, inside the workflow's timeout.
+const TIMEOUT_MS = 10_000;
+
+const INDEXNOW_ENDPOINT = "https://api.indexnow.org/indexnow";
+
+/**
+ * Warnings that do not fail the run, by check name, and why. Every other
+ * warning fails it, so a new one reaches someone. Keep this short.
+ */
+const ACCEPTED_WARNINGS = new Map([
+  ["http -> https", "the proxy in front of all three sites answers http:// with a 302, not a 301; that is proxy config, outside the app code"],
+]);
 
 /* --------------------------------------------------------------- helpers -- */
 
 const ORIGINS = JSON.parse(process.env.VISIBILITY_ORIGINS || "{}");
 const originFor = (host) => ORIGINS[host] ?? `https://${host}`;
 const overridden = (host) => host in ORIGINS;
+/** True when `host` is a local build but `service` is live: never mix the two. */
+const localVsLive = (host, service) => overridden(host) && !overridden(service);
 /** Map a public URL onto the (possibly overridden) origin for its host. */
 const toFetchable = (url) => {
   const u = new URL(url);
@@ -233,6 +252,7 @@ async function checkSite(site) {
   // origin and the title are what show the right app answered.
   const homeOrigin = new URL(toFetchable(home)).origin;
   let homeHtml = "";
+  let unreachable = 0;
   for (const c of CRAWLERS) {
     try {
       const { res, body, type } = await get(home, { ua: c.ua });
@@ -274,8 +294,15 @@ async function checkSite(site) {
       }
       if (c.token === "Googlebot") homeHtml = body;
     } catch (e) {
+      unreachable++;
       record(host, "FAIL", `home as ${c.token}`, `unreachable: ${e.message}`);
     }
+  }
+  // A site that never answers would spend a timeout on every remaining
+  // request; one FAIL says it all, and the report still gets written.
+  if (unreachable === CRAWLERS.length) {
+    record(host, "FAIL", "site", "unreachable for every crawler, remaining checks skipped");
+    return;
   }
 
   // 2. Entity: the structured data joins this site to Ibrahim Shareef.
@@ -456,49 +483,83 @@ async function checkSite(site) {
     record(host, "WARN", "unknown path", e.message);
   }
 
-  // 7. Optional: tell IndexNow about every URL. Fails closed without a live key.
-  if (process.env.SUBMIT_INDEXNOW === "true") {
+  // 7. Optional: tell IndexNow about every URL. Fails closed without a live
+  // key, and never announces a local build or URLs that just failed. Only
+  // this host's URLs go in: one foreign URL makes IndexNow reject the batch.
+  if (process.env.SUBMIT_INDEXNOW === "true" && !localVsLive(host, new URL(INDEXNOW_ENDPOINT).host)) {
+    const urlList = pages.slice(0, 10_000);
     if (!keyLive) {
       record(host, "WARN", "IndexNow submit", "skipped: key file is not live");
-    } else if (!locs.length) {
-      record(host, "WARN", "IndexNow submit", "skipped: no sitemap URLs");
+    } else if (!urlList.length) {
+      record(host, "WARN", "IndexNow submit", `skipped: no sitemap URLs on https://${host}`);
+    } else if (broken.length) {
+      record(host, "WARN", "IndexNow submit", `skipped: ${broken.length} sampled sitemap URL(s) are broken`);
     } else {
-      const res = await fetch("https://api.indexnow.org/indexnow", {
-        method: "POST",
-        headers: { "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({
-          host,
-          key: site.indexNowKey,
-          keyLocation: `https://${host}/${site.indexNowKey}.txt`,
-          urlList: locs.slice(0, 10_000),
-        }),
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      });
-      const ok = res.status === 200 || res.status === 202;
-      record(host, ok ? "PASS" : "FAIL", "IndexNow submit", `${locs.length} URLs -> HTTP ${res.status}`);
+      try {
+        const res = await fetch(toFetchable(INDEXNOW_ENDPOINT), {
+          method: "POST",
+          headers: { "content-type": "application/json; charset=utf-8" },
+          body: JSON.stringify({
+            host,
+            key: site.indexNowKey,
+            keyLocation: `https://${host}/${site.indexNowKey}.txt`,
+            urlList,
+          }),
+          signal: AbortSignal.timeout(TIMEOUT_MS),
+        });
+        const detail = `${urlList.length} URLs -> HTTP ${res.status}`;
+        // 200 accepted, 202 accepted while the key is validated, 429 rate
+        // limited (try later); anything else is a rejection with a reason.
+        if (res.status === 200 || res.status === 202) {
+          record(host, "PASS", "IndexNow submit", detail);
+        } else if (res.status === 429) {
+          record(host, "WARN", "IndexNow submit", `${detail}, rate limited, retry after ${res.headers.get("retry-after") ?? "a while"}`);
+        } else {
+          record(host, "FAIL", "IndexNow submit", `${detail}: ${(await res.text()).trim().slice(0, 200) || "no reason given"}`);
+        }
+      } catch (e) {
+        record(host, "FAIL", "IndexNow submit", `request failed: ${e.message}`);
+      }
     }
   }
 }
 
 /* ---------------------------------------------------------------- report -- */
 
-for (const site of SITES) await checkSite(site);
+for (const site of SITES) {
+  // One site's crash must not cut the report short for the others.
+  try {
+    await checkSite(site);
+  } catch (e) {
+    record(site.host, "FAIL", "check crashed", e.message);
+  }
+}
+
+const accepted = (r) => r.level === "WARN" && ACCEPTED_WARNINGS.has(r.check);
+const fails = results.filter((r) => r.level === "FAIL").length;
+const warns = results.filter((r) => r.level === "WARN").length;
+const unaccepted = results.filter((r) => r.level === "WARN" && !accepted(r)).length;
+const summary = `${fails} failing, ${warns} warnings (${unaccepted} not accepted), ${results.length - fails - warns} passing.`;
 
 const ICON = { PASS: "✅", WARN: "⚠️", FAIL: "❌" };
+const cell = (s) => String(s).replace(/\|/g, "\\|");
 const lines = [
   "## Visibility check",
   "",
-  `Run ${new Date().toISOString()}. ❌ = crawlers blocked or misled (fails the run). ⚠️ = a missing or weak signal.`,
+  `Run ${new Date().toISOString()}. ❌ = crawlers blocked or misled. ⚠️ = a missing or weak signal. Both fail the run, except the accepted warnings listed below.`,
   "",
   "| Site | | Check | Detail |",
   "|---|---|---|---|",
-  ...results.map((r) => `| ${r.site} | ${ICON[r.level]} | ${r.check} | ${String(r.detail).replace(/\|/g, "\\|")} |`),
+  ...results.map((r) => `| ${r.site} | ${ICON[r.level]} | ${cell(r.check)}${accepted(r) ? " (accepted)" : ""} | ${cell(r.detail)} |`),
+  "",
+  "Accepted warnings (reported, do not fail the run):",
+  "",
+  ...[...ACCEPTED_WARNINGS].map(([check, why]) => `- ${check}: ${why}`),
+  "",
+  summary,
 ];
 const markdown = lines.join("\n");
 console.log(markdown);
 if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown + "\n");
 
-const fails = results.filter((r) => r.level === "FAIL").length;
-const warns = results.filter((r) => r.level === "WARN").length;
-console.log(`\n${fails} failing, ${warns} warnings, ${results.length - fails - warns} passing.`);
-process.exit(fails ? 1 : 0);
+process.exit(fails || unaccepted ? 1 : 0);
