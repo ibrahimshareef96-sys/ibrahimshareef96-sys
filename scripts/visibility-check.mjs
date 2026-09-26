@@ -313,6 +313,19 @@ async function checkSite(site) {
     }
   }
 
+  // 6b. Soft 404: a path that cannot exist must not answer 200. An app shell
+  // that answers every path with 200 lets junk URLs into the index. WARN, not
+  // FAIL: it hurts quality, it does not block crawling.
+  try {
+    const probe = `https://${host}/visibility-check-no-such-page-${Date.now()}`;
+    const { res } = await get(probe, { redirect: "manual" });
+    const ok = res.status === 404 || res.status === 410;
+    record(host, ok ? "PASS" : "WARN", "unknown path",
+      ok ? `HTTP ${res.status}` : `HTTP ${res.status} (soft 404: want 404 for a page that does not exist)`);
+  } catch (e) {
+    record(host, "WARN", "unknown path", e.message);
+  }
+
   // 7. Optional: tell IndexNow about every URL. Fails closed without a live key.
   if (process.env.SUBMIT_INDEXNOW === "true") {
     if (!keyLive) {
