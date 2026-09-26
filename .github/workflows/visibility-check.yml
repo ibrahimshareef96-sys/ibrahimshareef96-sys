@@ -1,0 +1,35 @@
+name: Visibility check
+
+# Crawls shareefi.co, itqanstudio.com and projectyou.app as Googlebot,
+# Bingbot and the OpenAI, Anthropic and Perplexity crawlers, and fails when
+# something would block or mislead them. See scripts/visibility-check.mjs.
+on:
+  schedule:
+    - cron: "17 5 * * *" # daily, 09:17 in Dubai
+  workflow_dispatch:
+    inputs:
+      submit_indexnow:
+        description: "Also submit every sitemap URL to IndexNow (Bing, Yandex, Seznam, Naver, Yep). Use after a deploy that changed content."
+        type: boolean
+        default: false
+  push:
+    paths:
+      - ".github/workflows/visibility-check.yml"
+      - "scripts/visibility-check.mjs"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Crawl the live sites the way search and AI crawlers do
+        run: node scripts/visibility-check.mjs
+        env:
+          SUBMIT_INDEXNOW: ${{ inputs.submit_indexnow && 'true' || 'false' }}
