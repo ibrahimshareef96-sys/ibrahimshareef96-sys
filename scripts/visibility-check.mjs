@@ -25,7 +25,8 @@
  *                          those checks against a stub.
  *
  * Levels: FAIL = crawlers are blocked or misled. WARN = a signal is missing or
- * weak. Both fail the run (exit 1), except the warnings in ACCEPTED_WARNINGS:
+ * weak. Both fail the run (exit 1), except the warnings in ACCEPTED_WARNINGS
+ * (a check name plus the one known case it accepts, never the whole check):
  * GitHub only notifies on a failed run, so a warning on a green run reaches
  * nobody. The report lists the accepted warnings and why each is accepted.
  */
@@ -69,6 +70,9 @@ const SITES = [
     host: "projectyou.app",
     titleIncludes: "Project You",
     nameInText: null, // client-rendered; the name lives in JSON-LD + <noscript>
+    // One index.html answers every route, so a canonical would point /terms
+    // and /privacy at the home page.
+    homeCanonical: false,
     indexNowKey: "bdbc493db1edca63208e9dd953eb5dd7",
     entity: (nodes) =>
       JSON.stringify(nodes).includes(`"${PERSON_ID}"`) ||
@@ -97,16 +101,24 @@ const INDEXNOW_ENDPOINT = "https://api.indexnow.org/indexnow";
 // Apple's public lookup API lists released episodes, audio-only ones included,
 // so it is the source of truth for what shareefi.co/podcast should have.
 const PODCAST_APPLE_ID = "1789764233";
-// The newest Apple release may be at most this many days newer than the
-// newest episode page before the check warns.
+// Grace period, counted from each episode's release on Apple: an episode may
+// be out this many days with no page before the check warns.
 const PODCAST_MAX_LAG_DAYS = 7;
 
 /**
- * Warnings that do not fail the run, by check name, and why. Every other
- * warning fails it, so a new one reaches someone. Keep this short.
+ * Warnings that do not fail the run: a check name, why its warning is
+ * accepted, and `matches`, which picks out the one accepted case. Any other
+ * warning under the same name, and every other warning, fails the run, so a
+ * new one reaches someone. Keep this short.
  */
 const ACCEPTED_WARNINGS = new Map([
-  ["http -> https", "the proxy in front of all three sites answers http:// with a 302, not a 301; that is proxy config, outside the app code"],
+  ["http -> https", {
+    why: "the proxy in front of all three sites answers http:// with a 302, not a 301; that is proxy config, outside the app code",
+    // Check 6 warns only on a temporary redirect to the site's own https home
+    // page (no redirect, or one to anywhere else, is a FAIL there), and only
+    // the proxy's 302 is accepted.
+    matches: (r) => r.detail.startsWith("302 -> "),
+  }],
 ]);
 
 /* --------------------------------------------------------------- helpers -- */
@@ -150,6 +162,14 @@ const resolveUrl = (href, base) => {
     return "";
   }
 };
+
+/**
+ * An error's message, plus the cause that fetch's bare "fetch failed" hides
+ * (ENOTFOUND, ECONNREFUSED, CERT_HAS_EXPIRED, a redirect loop...). The code
+ * comes first: OpenSSL messages end in a newline.
+ */
+const why = (e) =>
+  e?.cause ? `${e.message} (${String(e.cause.code ?? e.cause.message).trim()})` : String(e?.message ?? e);
 
 /** The value of one attribute in one HTML tag (any quoting, any order), or undefined. */
 const attr = (tag, name) => {
@@ -306,7 +326,7 @@ async function checkSite(site) {
       if (c.token === "Googlebot") homeHtml = body;
     } catch (e) {
       unreachable++;
-      record(host, "FAIL", `home as ${c.token}`, `unreachable: ${e.message}`);
+      record(host, "FAIL", `home as ${c.token}`, `unreachable: ${why(e)}`);
     }
   }
   // A site that never answers would spend a timeout on every remaining
@@ -336,8 +356,12 @@ async function checkSite(site) {
         text.includes(site.nameInText) ? `"${site.nameInText}" is readable` : `"${site.nameInText}" never appears in the body text`);
     }
     // The canonical tells Google which URL (and host) this page belongs to.
+    // A site can opt out of having one (homeCanonical: false); a wrong one
+    // still fails.
     const canonical = canonicalOf(headOf(homeHtml));
-    if (!canonical) {
+    if (!canonical && site.homeCanonical === false) {
+      record(host, "PASS", "canonical", "none, by design (one app shell answers every route)");
+    } else if (!canonical) {
       record(host, "WARN", "canonical", "no <link rel=canonical> on the home page");
     } else if (resolveUrl(canonical, home) !== home) {
       record(host, "FAIL", "canonical", `home page canonical is ${canonical}, not ${home}`);
@@ -362,7 +386,7 @@ async function checkSite(site) {
       if (!sitemapUrls.length) record(host, "WARN", "robots.txt", "no Sitemap: line");
     }
   } catch (e) {
-    record(host, "FAIL", "robots.txt", `unreachable: ${e.message}`);
+    record(host, "FAIL", "robots.txt", `unreachable: ${why(e)}`);
   }
 
   // 4. Sitemap: every sitemap file (and every child of a sitemap index) is XML
@@ -379,7 +403,7 @@ async function checkSite(site) {
       throw new Error(`HTTP ${res.status}, ${type || "no content-type"}`);
     } catch (e) {
       sitemapsOk = false;
-      record(host, "FAIL", "sitemap", `${url}: ${e.message}`);
+      record(host, "FAIL", "sitemap", `${url}: ${why(e)}`);
       return "";
     }
   };
@@ -424,6 +448,7 @@ async function checkSite(site) {
   const offset = Math.floor(Date.now() / 86_400_000) % step;
   const sample = pages.filter((_, i) => i % step === offset).slice(0, SITEMAP_SAMPLE);
   const broken = [];
+  let uncanonical = 0;
   for (const url of sample) {
     const path = new URL(url).pathname;
     try {
@@ -433,19 +458,27 @@ async function checkSite(site) {
         continue;
       }
       const head = headOf(await res.text());
-      const noindex = [res.headers.get("x-robots-tag") ?? "", metaRobots(head, "Googlebot")].find((d) => blocksIndex(d, "Googlebot"));
-      if (noindex) broken.push(`${path} is noindex (${noindex})`);
+      // Indexable for every checked crawler, as on the home page: a
+      // "bingbot" meta or a "gptbot: noindex" header hides a page too.
+      const xRobots = res.headers.get("x-robots-tag") ?? "";
+      const noindexFor = CRAWLERS.filter((c) => blocksIndex(xRobots, c.token) || blocksIndex(metaRobots(head, c.token), c.token)).map((c) => c.token);
+      if (noindexFor.length) broken.push(`${path} is noindex for ${noindexFor.join(", ")}`);
       const canonical = canonicalOf(head);
-      if (canonical && resolveUrl(canonical, url) !== resolveUrl(url)) broken.push(`${path} canonical -> ${canonical}`);
+      if (!canonical) uncanonical++;
+      else if (resolveUrl(canonical, url) !== resolveUrl(url)) broken.push(`${path} canonical -> ${canonical}`);
     } catch (e) {
-      broken.push(`${path}: ${e.message}`);
+      broken.push(`${path}: ${why(e)}`);
     }
   }
   if (sample.length) {
+    const canonicals =
+      uncanonical === sample.length ? "none has a canonical"
+      : uncanonical ? `${uncanonical} without a canonical, the rest self-canonical`
+      : "self-canonical";
     record(host, broken.length ? "FAIL" : "PASS", "sitemap URLs",
       broken.length
         ? broken.join("; ")
-        : `${sample.length} of ${pages.length} sampled (slice ${offset + 1} of ${step}): all 200, indexable, self-canonical`);
+        : `${sample.length} of ${pages.length} sampled (slice ${offset + 1} of ${step}): all 200, indexable, ${canonicals}`);
   }
 
   // 5. llms.txt and the IndexNow key.
@@ -454,7 +487,7 @@ async function checkSite(site) {
     record(host, res.ok && type.includes("text/plain") ? "PASS" : "WARN", "llms.txt",
       res.ok && type.includes("text/plain") ? "served" : `HTTP ${res.status}, ${type}`);
   } catch (e) {
-    record(host, "WARN", "llms.txt", e.message);
+    record(host, "WARN", "llms.txt", why(e));
   }
   let keyLive = false;
   try {
@@ -462,36 +495,45 @@ async function checkSite(site) {
     keyLive = res.ok && body.trim() === site.indexNowKey;
     record(host, keyLive ? "PASS" : "WARN", "IndexNow key", keyLive ? "live" : `not live (HTTP ${res.status})`);
   } catch (e) {
-    record(host, "WARN", "IndexNow key", e.message);
+    record(host, "WARN", "IndexNow key", why(e));
   }
 
-  // 6. One host, one scheme: www and http both redirect permanently.
+  // 6. One host, one scheme: www and http both redirect permanently to this
+  // site's https home page. A temporary redirect there is a WARN. No
+  // redirect (a duplicate host), or one anywhere else (another site, a typo
+  // domain), is a FAIL. "https://shareefi.co" and "https://shareefi.co/" are
+  // the same target, so the Location is resolved before it is compared.
   if (!overridden(host)) {
     for (const [label, url] of [["www -> apex", `https://www.${host}/`], ["http -> https", `http://${host}/`]]) {
       try {
         const { res } = await get(url, { redirect: "manual" });
         const loc = res.headers.get("location") ?? "";
-        const permanent = [301, 308].includes(res.status);
-        const ok = permanent && loc.startsWith(`https://${host}`);
-        record(host, ok ? "PASS" : "WARN", label,
-          ok ? `${res.status} -> ${loc}` : `${res.status}${loc ? ` -> ${loc}` : ""} (want a 301/308 to https://${host})`);
+        const detail = `${res.status}${loc ? ` -> ${loc}` : ""}`;
+        const onTarget = resolveUrl(loc, url) === home;
+        if (onTarget && [301, 308].includes(res.status)) record(host, "PASS", label, detail);
+        else if (onTarget && [302, 307].includes(res.status)) record(host, "WARN", label, `${detail} (want a 301/308)`);
+        else record(host, "FAIL", label, `${detail} (want a 301/308 to ${home})`);
       } catch (e) {
-        record(host, "WARN", label, e.message);
+        // A name of its own, so an outage is never taken for an accepted warning.
+        record(host, "WARN", `${label} (unreachable)`, why(e));
       }
     }
   }
 
   // 6b. Soft 404: a path that cannot exist must not answer 200. An app shell
   // that answers every path with 200 lets junk URLs into the index. WARN, not
-  // FAIL: it hurts quality, it does not block crawling.
+  // FAIL: it hurts quality, it does not block crawling. Redirects are
+  // followed: a 308 to the trailing-slash form that then answers 404 is fine,
+  // a redirect to the home page (200) is the soft 404 this looks for.
   try {
     const probe = `https://${host}/visibility-check-no-such-page-${Date.now()}`;
-    const { res } = await get(probe, { redirect: "manual" });
-    const ok = res.status === 404 || res.status === 410;
+    const { res } = await get(probe);
+    const ok = (res.status === 404 || res.status === 410) && new URL(res.url).origin === homeOrigin;
+    const detail = `HTTP ${res.status}${res.redirected ? ` at ${res.url}, after a redirect` : ""}`;
     record(host, ok ? "PASS" : "WARN", "unknown path",
-      ok ? `HTTP ${res.status}` : `HTTP ${res.status} (soft 404: want 404 for a page that does not exist)`);
+      ok ? detail : `${detail} (soft 404: want 404 for a page that does not exist)`);
   } catch (e) {
-    record(host, "WARN", "unknown path", e.message);
+    record(host, "WARN", "unknown path", why(e));
   }
 
   // 7. Optional: tell IndexNow about every URL. Fails closed without a live
@@ -529,7 +571,7 @@ async function checkSite(site) {
           record(host, "FAIL", "IndexNow submit", `${detail}: ${(await res.text()).trim().slice(0, 200) || "no reason given"}`);
         }
       } catch (e) {
-        record(host, "FAIL", "IndexNow submit", `request failed: ${e.message}`);
+        record(host, "FAIL", "IndexNow submit", `request failed: ${why(e)}`);
       }
     }
   }
@@ -538,10 +580,13 @@ async function checkSite(site) {
 /* ------------------------------------------------------ podcast freshness -- */
 
 /**
- * A released episode with no /podcast/<episode> page on shareefi.co is
+ * A released episode with no /podcast/<number>-<slug> page on shareefi.co is
  * invisible to search and AI answers, and it is another absence nobody checks.
- * Compare the newest release on Apple with the newest episode page's lastmod
- * in the live sitemap (the site sets it to the episode's publish date).
+ * Match each of Apple's newest episodes to a page in the live sitemap by its
+ * episode number ("EP44 - ..." on Apple, /podcast/44-... on the site), and
+ * warn once one has been out on Apple for PODCAST_MAX_LAG_DAYS, counted from
+ * its own release, with no page. Dates cannot be compared instead: the site
+ * dates an episode by its YouTube release, weeks away from Apple's.
  */
 async function checkPodcastFreshness() {
   const check = "podcast freshness";
@@ -560,13 +605,10 @@ async function checkPodcastFreshness() {
       }
     }
     // Episode pages are /podcast/42-some-slug; /podcast/guests/... are not episodes.
-    const pageDates = [...sitemap.matchAll(/<url>([\s\S]*?)<\/url>/g)]
-      .filter((m) => /<loc>\s*https:\/\/shareefi\.co\/podcast\/\d+-[^/<\s]+\/?\s*<\/loc>/.test(m[1]))
-      .map((m) => m[1].match(/<lastmod>\s*(\d{4}-\d{2}-\d{2})/)?.[1])
-      .filter(Boolean)
-      .sort();
-    const newestPage = pageDates.at(-1);
-    if (!newestPage) throw new Error("no /podcast/<episode> URL with a lastmod");
+    const pageNumbers = new Set(
+      [...sitemap.matchAll(/<loc>\s*https:\/\/shareefi\.co\/podcast\/(\d+)-[^/<\s]+\/?\s*<\/loc>/g)].map((m) => Number(m[1])),
+    );
+    if (!pageNumbers.size) throw new Error("no /podcast/<number>-<slug> URL");
 
     stage = "Apple lookup";
     const { res, body } = await get(
@@ -577,22 +619,42 @@ async function checkPodcastFreshness() {
     const released = (JSON.parse(body).results ?? [])
       .filter((r) => (r.kind === "podcast-episode" || r.wrapperType === "podcastEpisode") && r.releaseDate)
       .sort((a, b) => b.releaseDate.localeCompare(a.releaseDate))
-      .map((r) => ({ title: r.trackName, date: r.releaseDate.slice(0, 10) }));
+      .map((r) => ({
+        title: r.trackName,
+        date: r.releaseDate.slice(0, 10),
+        releasedAt: Date.parse(r.releaseDate),
+        // "EP44 - ...", "Episode 44: ...", "Ep. #44 ..."; null when the title has no number.
+        number: Number(String(r.trackName).match(/\bep(?:isode)?\.?\s*#?(\d+)/i)?.[1]) || null,
+      }));
     if (!released.length) throw new Error("no episodes in the response");
 
-    const lagDays = (Date.parse(released[0].date) - Date.parse(newestPage)) / 86_400_000;
-    if (lagDays > PODCAST_MAX_LAG_DAYS) {
-      const missing = released.filter((e) => e.date > newestPage).slice(0, 10);
+    const list = (episodes) => episodes.map((e) => `${e.date} "${e.title}"`).join("; ");
+    const unnumbered = released.filter((e) => e.number === null);
+    if (unnumbered.length === released.length) {
+      // A title format without the number would otherwise pass forever.
+      record("shareefi.co", "WARN", check, `no episode number in any Apple title, so none can be matched to a page: ${list(released.slice(0, 3))}`);
+      return;
+    }
+    const cutoff = Date.now() - PODCAST_MAX_LAG_DAYS * 86_400_000;
+    const missing = released.filter((e) => e.number !== null && !pageNumbers.has(e.number));
+    const overdue = missing.filter((e) => e.releasedAt <= cutoff);
+    const scope = unnumbered.length
+      ? `the ${released.length - unnumbered.length} numbered episodes among Apple's ${released.length} newest`
+      : `Apple's ${released.length} newest episodes`;
+    const unchecked = unnumbered.length ? `; ${unnumbered.length} without an episode number not checked: ${list(unnumbered)}` : "";
+    if (overdue.length) {
       record("shareefi.co", "WARN", check,
-        `newest episode page is from ${newestPage}, Apple's newest release is ${lagDays} days later. ` +
-        `Released since, newest first: ${missing.map((e) => `${e.date} "${e.title}"`).join("; ")}`);
+        `out on Apple for over ${PODCAST_MAX_LAG_DAYS} days with no /podcast/<number>- page, newest first: ${list(overdue)}${unchecked}`);
     } else {
-      record("shareefi.co", "PASS", check, `newest episode page ${newestPage}, newest Apple release ${released[0].date}`);
+      record("shareefi.co", "PASS", check,
+        (missing.length
+          ? `${scope}: ${missing.length} with no page yet, inside the ${PODCAST_MAX_LAG_DAYS}-day grace from release: ${list(missing)}`
+          : `${scope} all have a page`) + unchecked);
     }
   } catch (e) {
     // Never pass on a failed lookup: a flake that hides a missing page is the
     // absence this check exists for.
-    record("shareefi.co", "WARN", check, `${stage} failed: ${e.message}`);
+    record("shareefi.co", "WARN", check, `${stage} failed: ${why(e)}`);
   }
 }
 
@@ -603,19 +665,21 @@ for (const site of SITES) {
   try {
     await checkSite(site);
   } catch (e) {
-    record(site.host, "FAIL", "check crashed", e.message);
+    record(site.host, "FAIL", "check crashed", why(e));
   }
 }
 await checkPodcastFreshness();
 
-const accepted = (r) => r.level === "WARN" && ACCEPTED_WARNINGS.has(r.check);
+const accepted = (r) => r.level === "WARN" && (ACCEPTED_WARNINGS.get(r.check)?.matches(r) ?? false);
 const fails = results.filter((r) => r.level === "FAIL").length;
 const warns = results.filter((r) => r.level === "WARN").length;
 const unaccepted = results.filter((r) => r.level === "WARN" && !accepted(r)).length;
 const summary = `${fails} failing, ${warns} warnings (${unaccepted} not accepted), ${results.length - fails - warns} passing.`;
 
 const ICON = { PASS: "✅", WARN: "⚠️", FAIL: "❌" };
-const cell = (s) => String(s).replace(/\|/g, "\\|");
+// One table row per result: a newline in a detail (a multi-line <title>, an
+// episode title, a rejection body) would split the row.
+const cell = (s) => String(s).replace(/\s*\n\s*/g, " ").replace(/\|/g, "\\|");
 const lines = [
   "## Visibility check",
   "",
@@ -627,12 +691,14 @@ const lines = [
   "",
   "Accepted warnings (reported, do not fail the run):",
   "",
-  ...[...ACCEPTED_WARNINGS].map(([check, why]) => `- ${check}: ${why}`),
+  ...[...ACCEPTED_WARNINGS].map(([check, accept]) => `- ${check}: ${accept.why}`),
   "",
   summary,
 ];
 const markdown = lines.join("\n");
 console.log(markdown);
-if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown + "\n");
+// The step summary renders HTML, so "no <link rel=canonical>" would lose its
+// tag there; escape it. The log keeps the plain text.
+if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown.replace(/</g, "&lt;") + "\n");
 
 process.exit(fails || unaccepted ? 1 : 0);
