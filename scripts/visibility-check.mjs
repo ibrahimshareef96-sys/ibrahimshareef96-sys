@@ -112,6 +112,58 @@ const headOf = (html) => {
   return end < 0 ? "" : html.slice(0, end);
 };
 
+/** An absolute URL for `href` against `base`, or "" when it does not parse. */
+const resolveUrl = (href, base) => {
+  try {
+    return new URL(href, base).href;
+  } catch {
+    return "";
+  }
+};
+
+/** The value of one attribute in one HTML tag (any quoting, any order), or undefined. */
+const attr = (tag, name) => {
+  const m = tag.match(new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, "i"));
+  return m ? (m[1] ?? m[2] ?? m[3]) : undefined;
+};
+
+const tagsIn = (html, name) => [...html.matchAll(new RegExp(`<${name}\\b[^>]*>`, "gi"))].map((m) => m[0]);
+
+/** The href of <link rel="canonical"> in a head, or "" when there is none. */
+const canonicalOf = (head) => {
+  const link = tagsIn(head, "link").find((t) => /(^|\s)canonical(\s|$)/i.test(attr(t, "rel") ?? ""));
+  return link ? (attr(link, "href") ?? "") : "";
+};
+
+/**
+ * The meta robots directives in a head that apply to one crawler: those in
+ * <meta name="robots"> plus those in <meta name="<token>">, e.g. "googlebot".
+ */
+const metaRobots = (head, token) =>
+  tagsIn(head, "meta")
+    .filter((t) => ["robots", token.toLowerCase()].includes((attr(t, "name") ?? "").toLowerCase()))
+    .map((t) => attr(t, "content") ?? "")
+    .join(", ");
+
+/**
+ * Does a directive list (meta robots content or X-Robots-Tag) tell this
+ * crawler not to index? "bingbot: noindex" scopes what follows to one
+ * crawler, and "max-image-preview:none" is a preview limit, not a noindex.
+ */
+function blocksIndex(directives, token) {
+  let scope = null;
+  for (const raw of directives.split(",")) {
+    let d = raw.trim().toLowerCase();
+    const m = d.match(/^([a-z_-]+)\s*:\s*(.*)$/);
+    if (m && !/^(max-snippet|max-image-preview|max-video-preview|unavailable_after)$/.test(m[1])) {
+      scope = m[1];
+      d = m[2];
+    }
+    if ((!scope || scope === token.toLowerCase()) && (d === "noindex" || d === "none")) return true;
+  }
+  return false;
+}
+
 function jsonLdNodes(html) {
   const nodes = [];
   const errors = [];
@@ -126,37 +178,42 @@ function jsonLdNodes(html) {
   return { nodes, errors };
 }
 
-/** Minimal robots.txt reading: is "/" allowed for this product token? */
-function robotsAllowsRoot(robotsTxt, token) {
+/**
+ * robots.txt reading per RFC 9309: may this product token fetch this path?
+ * Every group naming the token is merged (else every "*" group), only an
+ * Allow/Disallow line ends a run of User-agent lines (Sitemap, Crawl-delay
+ * and the like do not), "Googlebot/2.1" names Googlebot, and the longest
+ * matching rule wins, with Allow winning a tie. `*` and a trailing `$` work
+ * as wildcards.
+ */
+function robotsAllows(robotsTxt, token, path = "/") {
   const groups = [];
   let current = null;
-  let lastWasAgent = false;
+  let inAgents = false;
   for (const raw of robotsTxt.split(/\r?\n/)) {
-    const line = raw.replace(/#.*$/, "").trim();
-    const m = line.match(/^([A-Za-z-]+)\s*:\s*(.*)$/);
+    const m = raw.replace(/#.*$/, "").trim().match(/^([A-Za-z-]+)\s*:\s*(.*)$/);
     if (!m) continue;
-    const [, field, value] = m;
-    const key = field.toLowerCase();
+    const key = m[1].toLowerCase();
+    const value = m[2].trim();
     if (key === "user-agent") {
-      if (!lastWasAgent) groups.push((current = { agents: [], rules: [] }));
-      current.agents.push(value.toLowerCase());
-      lastWasAgent = true;
-    } else {
-      lastWasAgent = false;
-      if (current && (key === "allow" || key === "disallow")) {
-        current.rules.push({ allow: key === "allow", path: value });
-      }
+      if (!inAgents) groups.push((current = { agents: [], rules: [] }));
+      current.agents.push(value.toLowerCase().match(/^[a-z_*-]+/)?.[0] ?? "");
+      inAgents = true;
+    } else if (key === "allow" || key === "disallow") {
+      inAgents = false;
+      if (current && value) current.rules.push({ allow: key === "allow", path: value });
     }
   }
   const t = token.toLowerCase();
-  const group =
-    groups.find((g) => g.agents.includes(t)) ?? groups.find((g) => g.agents.includes("*"));
-  if (!group) return true;
-  // Longest matching rule for "/" wins; an Allow beats a Disallow of equal length.
-  const matching = group.rules
-    .filter((r) => r.path !== "" && ["/", "/*", "/$", "*"].includes(r.path))
+  let picked = groups.filter((g) => g.agents.includes(t));
+  if (!picked.length) picked = groups.filter((g) => g.agents.includes("*"));
+  const toRe = (p) =>
+    new RegExp("^" + p.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*").replace(/\\\$$/, "$"));
+  const hits = picked
+    .flatMap((g) => g.rules)
+    .filter((r) => toRe(r.path).test(path))
     .sort((a, b) => b.path.length - a.path.length || Number(b.allow) - Number(a.allow));
-  return matching.length === 0 || matching[0].allow;
+  return hits.length === 0 || hits[0].allow;
 }
 
 /* ---------------------------------------------------------------- checks -- */
@@ -167,8 +224,14 @@ const record = (site, level, check, detail = "") => results.push({ site, level, 
 async function checkSite(site) {
   const { host } = site;
   const home = `https://${host}/`;
+  /** Is this URL on this site (https, this exact host)? */
+  const onHost = (url) => resolveUrl(url).startsWith(`https://${host}/`);
 
-  // 1. Home page, once per crawler: reachable, indexable, titled in <head>.
+  // 1. Home page, once per crawler: reachable on this host, indexable, and
+  // titled in <head>. All three sites sit behind one proxy, so a misrouted
+  // host can answer with another site's (valid, indexable) page: the final
+  // origin and the title are what show the right app answered.
+  const homeOrigin = new URL(toFetchable(home)).origin;
   let homeHtml = "";
   for (const c of CRAWLERS) {
     try {
@@ -177,19 +240,23 @@ async function checkSite(site) {
         record(host, "FAIL", `home as ${c.token}`, `HTTP ${res.status}`);
         continue;
       }
+      if (new URL(res.url).origin !== homeOrigin) {
+        record(host, "FAIL", `home as ${c.token}`, `redirected off the site: ended on ${res.url}`);
+        continue;
+      }
       if (!type.includes("text/html")) {
         record(host, "FAIL", `home as ${c.token}`, `content-type ${type}`);
         continue;
       }
       const xRobots = res.headers.get("x-robots-tag") ?? "";
-      if (/noindex|none/i.test(xRobots)) {
+      if (blocksIndex(xRobots, c.token)) {
         record(host, "FAIL", `home as ${c.token}`, `X-Robots-Tag: ${xRobots}`);
         continue;
       }
       const head = headOf(body);
-      const metaRobots = head.match(/<meta[^>]+name=["']robots["'][^>]+content=["']([^"']*)["']/i)?.[1] ?? "";
-      if (/noindex|none/i.test(metaRobots)) {
-        record(host, "FAIL", `home as ${c.token}`, `meta robots: ${metaRobots}`);
+      const robotsMeta = metaRobots(head, c.token);
+      if (blocksIndex(robotsMeta, c.token)) {
+        record(host, "FAIL", `home as ${c.token}`, `meta robots: ${robotsMeta}`);
         continue;
       }
       const title = head.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? "";
@@ -198,7 +265,7 @@ async function checkSite(site) {
         continue;
       }
       if (!title.includes(site.titleIncludes)) {
-        record(host, "WARN", `home as ${c.token}`, `title "${title}" lacks "${site.titleIncludes}"`);
+        record(host, "FAIL", `home as ${c.token}`, `title "${title}" lacks "${site.titleIncludes}" (is another app answering?)`);
       } else {
         record(host, "PASS", `home as ${c.token}`, `200, title in <head>`);
       }
@@ -218,20 +285,39 @@ async function checkSite(site) {
     const verdict = site.entity(nodes);
     record(host, verdict === true ? "PASS" : "WARN", "entity link", verdict === true ? `${nodes.length} JSON-LD nodes` : verdict);
     if (site.nameInText) {
-      const text = homeHtml.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ");
+      // Body text only: the <title> is checked above, and counting it here
+      // would let this pass on a page whose visible text never names him.
+      const bodyStart = homeHtml.search(/<body[\s>]/i);
+      const bodyHtml = bodyStart >= 0 ? homeHtml.slice(bodyStart) : homeHtml.slice(headOf(homeHtml).length);
+      const text = bodyHtml
+        .replace(/<(script|style|noscript|template)\b[\s\S]*?<\/\1>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;|&#160;/g, " ")
+        .replace(/\s+/g, " ");
       record(host, text.includes(site.nameInText) ? "PASS" : "WARN", "name in page text",
-        text.includes(site.nameInText) ? `"${site.nameInText}" is readable` : `"${site.nameInText}" never appears as text`);
+        text.includes(site.nameInText) ? `"${site.nameInText}" is readable` : `"${site.nameInText}" never appears in the body text`);
+    }
+    // The canonical tells Google which URL (and host) this page belongs to.
+    const canonical = canonicalOf(headOf(homeHtml));
+    if (!canonical) {
+      record(host, "WARN", "canonical", "no <link rel=canonical> on the home page");
+    } else if (resolveUrl(canonical, home) !== home) {
+      record(host, "FAIL", "canonical", `home page canonical is ${canonical}, not ${home}`);
+    } else {
+      record(host, "PASS", "canonical", canonical);
     }
   }
 
   // 3. robots.txt: a real robots file that lets every crawler we care about in.
   let sitemapUrls = [];
+  let robotsTxt = null;
   try {
     const { res, body, type } = await get(`https://${host}/robots.txt`);
     if (!res.ok || !type.includes("text/plain")) {
       record(host, "FAIL", "robots.txt", `HTTP ${res.status}, ${type || "no content-type"} (not a robots file)`);
     } else {
-      const blocked = CRAWLERS.filter((c) => !robotsAllowsRoot(body, c.token)).map((c) => c.token);
+      robotsTxt = body;
+      const blocked = CRAWLERS.filter((c) => !robotsAllows(body, c.token, "/")).map((c) => c.token);
       record(host, blocked.length ? "FAIL" : "PASS", "robots.txt",
         blocked.length ? `blocks / for ${blocked.join(", ")}` : "allows / for every checked crawler");
       sitemapUrls = [...body.matchAll(/^\s*sitemap\s*:\s*(\S+)/gim)].map((m) => m[1]);
@@ -241,43 +327,87 @@ async function checkSite(site) {
     record(host, "FAIL", "robots.txt", `unreachable: ${e.message}`);
   }
 
-  // 4. Sitemap: parses, and a sample of its URLs answer 200 without redirecting.
-  const locs = [];
-  for (const sm of sitemapUrls.length ? sitemapUrls : [`https://${host}/sitemap.xml`]) {
+  // 4. Sitemap: every sitemap file (and every child of a sitemap index) is XML
+  // served from this host, and together they list page URLs on this host that
+  // robots.txt lets every crawler fetch. A sample of those URLs answer 200
+  // without redirecting, are indexable, and name themselves as canonical.
+  let sitemapsOk = true;
+  /** One sitemap file's body, or "" (after recording a FAIL) when it is not usable. */
+  const readSitemap = async (url) => {
     try {
-      const { res, body, type } = await get(sm);
-      if (!res.ok || !/xml/.test(type)) {
-        record(host, "FAIL", "sitemap", `${sm}: HTTP ${res.status}, ${type || "no content-type"}`);
-        continue;
-      }
-      const found = [...body.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1]);
-      if (/<sitemapindex/i.test(body)) {
-        for (const child of found) {
-          const r = await get(child);
-          locs.push(...[...r.body.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1]));
-        }
-      } else {
-        locs.push(...found);
-      }
-      const lastmods = new Set([...body.matchAll(/<lastmod>([^<]+)<\/lastmod>/g)].map((m) => m[1].slice(0, 10)));
-      record(host, "PASS", "sitemap", `${found.length} URLs, ${lastmods.size} distinct lastmod date(s)`);
+      if (!onHost(url)) throw new Error(`not on https://${host}`);
+      const { res, body, type } = await get(url);
+      if (res.ok && /xml/.test(type)) return body;
+      throw new Error(`HTTP ${res.status}, ${type || "no content-type"}`);
     } catch (e) {
-      record(host, "FAIL", "sitemap", `${sm}: ${e.message}`);
+      sitemapsOk = false;
+      record(host, "FAIL", "sitemap", `${url}: ${e.message}`);
+      return "";
+    }
+  };
+  const locsIn = (xml) => [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1]);
+  const found = [];
+  const lastmods = new Set();
+  for (const sm of sitemapUrls.length ? sitemapUrls : [`https://${host}/sitemap.xml`]) {
+    const xml = await readSitemap(sm);
+    // A sitemap index lists child sitemaps, not pages: read each child.
+    const urlsets = /<sitemapindex[\s>]/i.test(xml) ? [] : [xml];
+    if (!urlsets.length) for (const child of locsIn(xml)) urlsets.push(await readSitemap(child));
+    for (const set of urlsets) {
+      found.push(...locsIn(set));
+      for (const m of set.matchAll(/<lastmod>\s*([^<\s]+)\s*<\/lastmod>/g)) lastmods.add(m[1].slice(0, 10));
     }
   }
-  const sample = locs.filter((_, i) => i % Math.max(1, Math.ceil(locs.length / SITEMAP_SAMPLE)) === 0).slice(0, SITEMAP_SAMPLE);
+  const locs = [...new Set(found)];
+  if (!locs.length) {
+    record(host, "FAIL", "sitemap", "no page URLs in any sitemap");
+  } else if (sitemapsOk) {
+    record(host, "PASS", "sitemap", `${locs.length} page URLs, ${lastmods.size} distinct lastmod date(s)`);
+  }
+  const pages = locs.filter(onHost);
+  if (locs.length) {
+    const foreign = locs.filter((u) => !onHost(u));
+    record(host, foreign.length ? "FAIL" : "PASS", "sitemap hosts",
+      foreign.length ? `${foreign.length} URL(s) not on https://${host}, e.g. ${foreign[0]}` : `every URL is on https://${host}`);
+  }
+  if (robotsTxt !== null && pages.length) {
+    const disallowed = pages.flatMap((u) => {
+      const { pathname, search } = new URL(u);
+      const blocked = CRAWLERS.filter((c) => !robotsAllows(robotsTxt, c.token, pathname + search)).map((c) => c.token);
+      return blocked.length ? [`${pathname}${search} (${blocked.join(", ")})`] : [];
+    });
+    record(host, disallowed.length ? "FAIL" : "PASS", "sitemap vs robots",
+      disallowed.length
+        ? `${disallowed.length} sitemap URL(s) disallowed: ${disallowed.slice(0, 5).join("; ")}`
+        : `${pages.length} URLs allowed for every checked crawler`);
+  }
+  // The sample moves one slot each day, so every URL is checked within `step` days.
+  const step = Math.max(1, Math.ceil(pages.length / SITEMAP_SAMPLE));
+  const offset = Math.floor(Date.now() / 86_400_000) % step;
+  const sample = pages.filter((_, i) => i % step === offset).slice(0, SITEMAP_SAMPLE);
   const broken = [];
   for (const url of sample) {
+    const path = new URL(url).pathname;
     try {
       const { res } = await get(url, { redirect: "manual" });
-      if (res.status !== 200) broken.push(`${new URL(url).pathname} -> ${res.status}`);
+      if (res.status !== 200) {
+        broken.push(`${path} -> ${res.status}`);
+        continue;
+      }
+      const head = headOf(await res.text());
+      const noindex = [res.headers.get("x-robots-tag") ?? "", metaRobots(head, "Googlebot")].find((d) => blocksIndex(d, "Googlebot"));
+      if (noindex) broken.push(`${path} is noindex (${noindex})`);
+      const canonical = canonicalOf(head);
+      if (canonical && resolveUrl(canonical, url) !== resolveUrl(url)) broken.push(`${path} canonical -> ${canonical}`);
     } catch (e) {
-      broken.push(`${url}: ${e.message}`);
+      broken.push(`${path}: ${e.message}`);
     }
   }
   if (sample.length) {
     record(host, broken.length ? "FAIL" : "PASS", "sitemap URLs",
-      broken.length ? broken.join("; ") : `${sample.length} sampled, all 200`);
+      broken.length
+        ? broken.join("; ")
+        : `${sample.length} of ${pages.length} sampled (slice ${offset + 1} of ${step}): all 200, indexable, self-canonical`);
   }
 
   // 5. llms.txt and the IndexNow key.
