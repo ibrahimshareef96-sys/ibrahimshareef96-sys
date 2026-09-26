@@ -2,7 +2,7 @@
 
 **AI agent engineer. Dubai, UAE.**
 
-Ibrahim Shareef runs [Itqan Studio](https://itqanstudio.com), hosts [The Barakah Blueprint](https://shareefi.co/podcast) podcast and builds in public at [shareefi.co](https://shareefi.co).
+Ibrahim Shareef co-founded and runs [Itqan Studio](https://itqanstudio.com), hosts [The Barakah Blueprint](https://shareefi.co/podcast) podcast and builds in public at [shareefi.co](https://shareefi.co).
 
 [![Website](https://img.shields.io/badge/shareefi.co-0d282b?style=for-the-badge&logoColor=d7fd64)](https://shareefi.co)
 [![Itqan Studio](https://img.shields.io/badge/Itqan_Studio-0d282b?style=for-the-badge&logoColor=d7fd64)](https://itqanstudio.com)
@@ -20,7 +20,7 @@ I build the layer around the model. Review gates that fail closed, retrieval tha
 
 I came in sideways. I left pharmacy and spent the next stretch on survival jobs: substitute teaching, a warehouse, customer support tickets. At night I taught myself design off YouTube, shipped work that was genuinely ugly, and turned it into a paying portfolio. Then a technical consultant role in Sweden asked for Arabic, the applicant pool was nearly empty, and the portfolio made the argument for me. Dubai came later.
 
-I run [Itqan Studio](https://itqanstudio.com), a B2B web and AI agency, and I host [The Barakah Blueprint](https://shareefi.co/podcast) podcast, 40+ episodes in. Itqan is Arabic for doing something with the precision it deserves, which is a hard standard to keep when a model writes code faster than you can read it. That gap is what most of my tooling is for.
+I co-founded [Itqan Studio](https://itqanstudio.com), a B2B web and AI agency, with Bisma Aslam and run it as CEO, and I host [The Barakah Blueprint](https://shareefi.co/podcast) podcast, 40+ episodes in. Itqan is Arabic for doing something with the precision it deserves, which is a hard standard to keep when a model writes code faster than you can read it. That gap is what most of my tooling is for.
 
 I am a hafiz of the Qur'an. You either have the text exactly or you do not, and that is roughly how I feel about citations in software.
 
