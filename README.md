@@ -2,8 +2,11 @@
 
 **AI agent engineer. Dubai, UAE.**
 
+Ibrahim Shareef runs [Itqan Studio](https://itqanstudio.com), hosts [The Barakah Blueprint](https://shareefi.co/podcast) podcast and builds in public at [shareefi.co](https://shareefi.co).
+
 [![Website](https://img.shields.io/badge/shareefi.co-0d282b?style=for-the-badge&logoColor=d7fd64)](https://shareefi.co)
 [![Itqan Studio](https://img.shields.io/badge/Itqan_Studio-0d282b?style=for-the-badge&logoColor=d7fd64)](https://itqanstudio.com)
+[![The Barakah Blueprint](https://img.shields.io/badge/The_Barakah_Blueprint-0d282b?style=for-the-badge&logo=applepodcasts&logoColor=d7fd64)](https://shareefi.co/podcast)
 [![ProjectYou](https://img.shields.io/badge/ProjectYou-d7fd64?style=for-the-badge&labelColor=0d282b)](https://projectyou.app)
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-0d282b?style=for-the-badge&logo=linkedin&logoColor=d7fd64)](https://www.linkedin.com/in/shareefibrahim/)
@@ -17,7 +20,7 @@ I build the layer around the model. Review gates that fail closed, retrieval tha
 
 I came in sideways. I left pharmacy and spent the next stretch on survival jobs: substitute teaching, a warehouse, customer support tickets. At night I taught myself design off YouTube, shipped work that was genuinely ugly, and turned it into a paying portfolio. Then a technical consultant role in Sweden asked for Arabic, the applicant pool was nearly empty, and the portfolio made the argument for me. Dubai came later.
 
-I run [Itqan Studio](https://itqanstudio.com), a B2B web and AI agency, and I host the Barakah Blueprint podcast, 40+ episodes in. Itqan is Arabic for doing something with the precision it deserves, which is a hard standard to keep when a model writes code faster than you can read it. That gap is what most of my tooling is for.
+I run [Itqan Studio](https://itqanstudio.com), a B2B web and AI agency, and I host [The Barakah Blueprint](https://shareefi.co/podcast) podcast, 40+ episodes in. Itqan is Arabic for doing something with the precision it deserves, which is a hard standard to keep when a model writes code faster than you can read it. That gap is what most of my tooling is for.
 
 I am a hafiz of the Qur'an. You either have the text exactly or you do not, and that is roughly how I feel about citations in software.
 
