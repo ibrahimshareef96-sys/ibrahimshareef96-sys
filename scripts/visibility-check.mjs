@@ -16,10 +16,13 @@
  *                          telling engines about changes, not a daily blast.
  *   VISIBILITY_ORIGINS     JSON map of host -> origin, to point the check at a
  *                          local build, e.g. {"shareefi.co":"http://localhost:3012"}.
- *                          Redirect checks are skipped for overridden hosts, and
- *                          so is the IndexNow submit: a local build is never
- *                          announced to the live service. Override
- *                          api.indexnow.org too to run the submit against a stub.
+ *                          Redirect checks are skipped for overridden hosts. So
+ *                          are the checks that pair a site with a live service
+ *                          (the IndexNow submit, podcast freshness against
+ *                          Apple), so a local build is never announced to, or
+ *                          compared with, live data. Override that service's
+ *                          host too (api.indexnow.org, itunes.apple.com) to run
+ *                          those checks against a stub.
  *
  * Levels: FAIL = crawlers are blocked or misled. WARN = a signal is missing or
  * weak. Both fail the run (exit 1), except the warnings in ACCEPTED_WARNINGS:
@@ -89,6 +92,14 @@ const SITEMAP_SAMPLE = 12;
 const TIMEOUT_MS = 10_000;
 
 const INDEXNOW_ENDPOINT = "https://api.indexnow.org/indexnow";
+
+// The Barakah Blueprint on Apple Podcasts (podcasts.apple.com/podcast/id1789764233).
+// Apple's public lookup API lists released episodes, audio-only ones included,
+// so it is the source of truth for what shareefi.co/podcast should have.
+const PODCAST_APPLE_ID = "1789764233";
+// The newest Apple release may be at most this many days newer than the
+// newest episode page before the check warns.
+const PODCAST_MAX_LAG_DAYS = 7;
 
 /**
  * Warnings that do not fail the run, by check name, and why. Every other
@@ -524,6 +535,67 @@ async function checkSite(site) {
   }
 }
 
+/* ------------------------------------------------------ podcast freshness -- */
+
+/**
+ * A released episode with no /podcast/<episode> page on shareefi.co is
+ * invisible to search and AI answers, and it is another absence nobody checks.
+ * Compare the newest release on Apple with the newest episode page's lastmod
+ * in the live sitemap (the site sets it to the episode's publish date).
+ */
+async function checkPodcastFreshness() {
+  const check = "podcast freshness";
+  if (localVsLive("shareefi.co", "itunes.apple.com")) return; // a local build says nothing about what is live
+  let stage = "shareefi.co sitemap";
+  try {
+    const { res: sitemapRes, body: top } = await get("https://shareefi.co/sitemap.xml");
+    if (!sitemapRes.ok) throw new Error(`HTTP ${sitemapRes.status}`);
+    // Follow a sitemap index to its children. A broken child is already a
+    // FAIL in the sitemap check, so here it only contributes nothing.
+    let sitemap = top;
+    if (/<sitemapindex[\s>]/i.test(top)) {
+      sitemap = "";
+      for (const m of top.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)) {
+        sitemap += await get(m[1]).then(({ res, body }) => (res.ok ? body : ""), () => "");
+      }
+    }
+    // Episode pages are /podcast/42-some-slug; /podcast/guests/... are not episodes.
+    const pageDates = [...sitemap.matchAll(/<url>([\s\S]*?)<\/url>/g)]
+      .filter((m) => /<loc>\s*https:\/\/shareefi\.co\/podcast\/\d+-[^/<\s]+\/?\s*<\/loc>/.test(m[1]))
+      .map((m) => m[1].match(/<lastmod>\s*(\d{4}-\d{2}-\d{2})/)?.[1])
+      .filter(Boolean)
+      .sort();
+    const newestPage = pageDates.at(-1);
+    if (!newestPage) throw new Error("no /podcast/<episode> URL with a lastmod");
+
+    stage = "Apple lookup";
+    const { res, body } = await get(
+      `https://itunes.apple.com/lookup?id=${PODCAST_APPLE_ID}&media=podcast&entity=podcastEpisode&limit=10`,
+      { ua: "visibility-check" },
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const released = (JSON.parse(body).results ?? [])
+      .filter((r) => (r.kind === "podcast-episode" || r.wrapperType === "podcastEpisode") && r.releaseDate)
+      .sort((a, b) => b.releaseDate.localeCompare(a.releaseDate))
+      .map((r) => ({ title: r.trackName, date: r.releaseDate.slice(0, 10) }));
+    if (!released.length) throw new Error("no episodes in the response");
+
+    const lagDays = (Date.parse(released[0].date) - Date.parse(newestPage)) / 86_400_000;
+    if (lagDays > PODCAST_MAX_LAG_DAYS) {
+      const missing = released.filter((e) => e.date > newestPage).slice(0, 10);
+      record("shareefi.co", "WARN", check,
+        `newest episode page is from ${newestPage}, Apple's newest release is ${lagDays} days later. ` +
+        `Released since, newest first: ${missing.map((e) => `${e.date} "${e.title}"`).join("; ")}`);
+    } else {
+      record("shareefi.co", "PASS", check, `newest episode page ${newestPage}, newest Apple release ${released[0].date}`);
+    }
+  } catch (e) {
+    // Never pass on a failed lookup: a flake that hides a missing page is the
+    // absence this check exists for.
+    record("shareefi.co", "WARN", check, `${stage} failed: ${e.message}`);
+  }
+}
+
 /* ---------------------------------------------------------------- report -- */
 
 for (const site of SITES) {
@@ -534,6 +606,7 @@ for (const site of SITES) {
     record(site.host, "FAIL", "check crashed", e.message);
   }
 }
+await checkPodcastFreshness();
 
 const accepted = (r) => r.level === "WARN" && ACCEPTED_WARNINGS.has(r.check);
 const fails = results.filter((r) => r.level === "FAIL").length;
