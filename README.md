@@ -7,7 +7,7 @@ Ibrahim Shareef co-founded and runs [Itqan Studio](https://itqanstudio.com), hos
 [![Website](https://img.shields.io/badge/shareefi.co-0d282b?style=for-the-badge&logoColor=d7fd64)](https://shareefi.co)
 [![Itqan Studio](https://img.shields.io/badge/Itqan_Studio-0d282b?style=for-the-badge&logoColor=d7fd64)](https://itqanstudio.com)
 [![The Barakah Blueprint](https://img.shields.io/badge/The_Barakah_Blueprint-0d282b?style=for-the-badge&logo=applepodcasts&logoColor=d7fd64)](https://shareefi.co/podcast)
-[![ProjectYou](https://img.shields.io/badge/ProjectYou-d7fd64?style=for-the-badge&labelColor=0d282b)](https://projectyou.app)
+[![Project You](https://img.shields.io/badge/Project_You-d7fd64?style=for-the-badge&labelColor=0d282b)](https://projectyou.app)
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-0d282b?style=for-the-badge&logo=linkedin&logoColor=d7fd64)](https://www.linkedin.com/in/shareefibrahim/)
 [![YouTube](https://img.shields.io/badge/YouTube-0d282b?style=for-the-badge&logo=youtube&logoColor=d7fd64)](https://www.youtube.com/@shareefico)
@@ -48,7 +48,7 @@ W3C DTCG motion tokens compiled to CSS, JS and Tailwind, with a component utilit
 
 Four AI advisors, each answering inside a sealed context window, genuinely blind to each other, so they cannot converge into one agreeable voice. They are built to disagree. The Operator refuses to think past eight weeks. The Capital Allocator refuses to think inside them. When they split, the split is the part worth reading.
 
-**Also shipped:** [ProjectYou](https://projectyou.app), a Qur'an-centric life OS, a CMS I built and still run, and the Itqan CRM, which is a Next.js portal with a self-hosted Supabase behind it and an iOS app in front of it.
+**Also shipped:** [Project You](https://projectyou.app), a Qur'an-centric life OS, a CMS I built and still run, and the Itqan CRM, which is a Next.js portal with a self-hosted Supabase behind it and an iOS app in front of it.
 
 The iOS app is deliberately a WebView around the portal, so every deploy reaches the phone without waiting on App Review. The native layer only does what a WebView genuinely cannot: push with deep links pinned to the portal origin, a Face ID lock, a share extension in Swift, and an offline write queue that replays through the page rather than natively, because React Native's fetch does not carry the WebView's session and a queue that silently 401s is worse than no queue at all. I learned that one from a review board, not from a user, which was lucky.
 
