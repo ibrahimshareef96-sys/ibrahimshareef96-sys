@@ -23,6 +23,8 @@
  *                          compared with, live data. Override that service's
  *                          host too (api.indexnow.org, itunes.apple.com) to run
  *                          those checks against a stub.
+ *   VISIBILITY_REPORT      a file path: the markdown report is also written
+ *                          there (the workflow files it as a GitHub issue).
  *
  * Levels: FAIL = crawlers are blocked or misled. WARN = a signal is missing or
  * weak. Both fail the run (exit 1), except the warnings in ACCEPTED_WARNINGS
@@ -31,40 +33,53 @@
  * nobody. The report lists the accepted warnings and why each is accepted.
  */
 
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 
 /* ---------------------------------------------------------------- config -- */
 
 const PERSON_ID = "https://shareefi.co/#person";
+const ORG_ID = "https://itqanstudio.com/#organization";
+const LINKEDIN = "https://www.linkedin.com/in/shareefibrahim/";
 
+/**
+ * The entity joins each site must carry, checked as typed nodes rather than as
+ * strings anywhere in the JSON: the same person @id on every site, the studio
+ * as one Organization @id, and each relationship pointing at the other's @id.
+ * Each check returns true, or what is missing.
+ */
 const SITES = [
   {
     host: "shareefi.co",
     titleIncludes: "Ibrahim Shareef",
     nameInText: "Ibrahim Shareef",
+    // The page that answers "who is Ibrahim Shareef": fetched as every crawler.
+    keyPages: ["/about"],
     indexNowKey: "d0e9e916ece615af996965b082904092",
-    entity: (nodes) =>
-      nodes.some(
-        (n) =>
-          hasType(n, "Person") &&
-          n["@id"] === PERSON_ID &&
-          n.name === "Ibrahim Shareef" &&
-          Array.isArray(n.sameAs) &&
-          n.sameAs.length >= 5,
-      ) || `no Person node ${PERSON_ID} named "Ibrahim Shareef" with 5+ sameAs links`,
+    entity: (nodes) => {
+      const person = nodes.find((n) => hasType(n, "Person") && n["@id"] === PERSON_ID);
+      if (!person || person.name !== "Ibrahim Shareef") return `no Person node ${PERSON_ID} named "Ibrahim Shareef"`;
+      if (!ids(person.sameAs).includes(LINKEDIN)) return `Person.sameAs lacks his LinkedIn (${LINKEDIN})`;
+      if (!ids(person.worksFor).includes(ORG_ID)) return `Person.worksFor does not point at ${ORG_ID}`;
+      const org = nodes.find((n) => hasType(n, "Organization") && n["@id"] === ORG_ID);
+      if (!org || !ids(org.founder).includes(PERSON_ID)) return `no Organization ${ORG_ID} whose founder includes ${PERSON_ID}`;
+      return true;
+    },
   },
   {
     host: "itqanstudio.com",
     titleIncludes: "Itqan",
     nameInText: "Ibrahim Shareef",
+    keyPages: ["/about"],
     indexNowKey: "6bd42839add7a68fecb11bc425290ad5",
-    entity: (nodes) =>
-      nodes.some(
-        (n) =>
-          hasType(n, "Person") &&
-          n.name === "Ibrahim Shareef" &&
-          [].concat(n.sameAs ?? []).some((u) => String(u).startsWith("https://shareefi.co")),
-      ) || "the founder Person does not link to shareefi.co in sameAs",
+    entity: (nodes) => {
+      const org = nodes.find((n) => hasType(n, "Organization") && n["@id"] === ORG_ID);
+      if (!org) return `no Organization node ${ORG_ID}`;
+      if (!ids(org.founder).includes(PERSON_ID)) return `Organization.founder does not include ${PERSON_ID}`;
+      const person = nodes.find((n) => hasType(n, "Person") && n["@id"] === PERSON_ID);
+      if (!person || person.name !== "Ibrahim Shareef") return `no Person node ${PERSON_ID} named "Ibrahim Shareef"`;
+      if (!ids(person.sameAs).some((u) => u.startsWith("https://shareefi.co"))) return "the founder Person does not link to shareefi.co in sameAs";
+      return true;
+    },
   },
   {
     host: "projectyou.app",
@@ -73,21 +88,37 @@ const SITES = [
     // One index.html answers every route, so a canonical would point /terms
     // and /privacy at the home page.
     homeCanonical: false,
+    keyPages: [],
     indexNowKey: "bdbc493db1edca63208e9dd953eb5dd7",
-    entity: (nodes) =>
-      JSON.stringify(nodes).includes(`"${PERSON_ID}"`) ||
-      `nothing references the creator ${PERSON_ID}`,
+    entity: (nodes) => {
+      const app = nodes.find((n) => hasType(n, "WebApplication") || hasType(n, "SoftwareApplication"));
+      if (!app) return "no WebApplication node";
+      if (!ids(app.creator).includes(PERSON_ID)) return `the app's creator is not ${PERSON_ID}`;
+      if (!ids(app.publisher).includes(ORG_ID)) return `the app's publisher is not ${ORG_ID}`;
+      return true;
+    },
   },
 ];
 
-/** Crawlers whose view of the site matters. Token = robots.txt product token. */
+/**
+ * Crawlers whose view of the site matters. Token = robots.txt product token.
+ * The search crawlers build the indexes assistants answer from; the "-User"
+ * agents fetch a page live when someone asks an assistant about it. Strings
+ * are the vendors' documented ones (checked 2026-09-27: OpenAI's and
+ * Perplexity's bot pages). Anthropic documents its tokens but not full
+ * strings, so its three follow the ClaudeBot format around each token.
+ */
 const CRAWLERS = [
   { token: "Googlebot", ua: "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" },
   { token: "Bingbot", ua: "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)" },
-  { token: "OAI-SearchBot", ua: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot" },
-  { token: "GPTBot", ua: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)" },
+  { token: "OAI-SearchBot", ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36; compatible; OAI-SearchBot/1.4; +https://openai.com/searchbot" },
+  { token: "ChatGPT-User", ua: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot" },
+  { token: "GPTBot", ua: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.4; +https://openai.com/gptbot" },
   { token: "ClaudeBot", ua: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)" },
+  { token: "Claude-SearchBot", ua: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Claude-SearchBot/1.0; +claudebot@anthropic.com)" },
+  { token: "Claude-User", ua: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Claude-User/1.0; +Claude-User@anthropic.com)" },
   { token: "PerplexityBot", ua: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)" },
+  { token: "Perplexity-User", ua: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Perplexity-User/1.0; +https://perplexity.ai/perplexity-user)" },
 ];
 
 const SITEMAP_SAMPLE = 12;
@@ -104,6 +135,12 @@ const PODCAST_APPLE_ID = "1789764233";
 // Grace period, counted from each episode's release on Apple: an episode may
 // be out this many days with no page before the check warns.
 const PODCAST_MAX_LAG_DAYS = 7;
+// Released episodes with no page on purpose, and why. Every other released
+// episode must have one. When one of these gets a page, the check says so, so
+// the entry is removed rather than left to hide a future gap.
+const EPISODES_WITHOUT_PAGE = new Map([
+  [12, "audio only: released on Apple and Spotify, never on YouTube"],
+]);
 
 /**
  * Warnings that do not fail the run: a check name, why its warning is
@@ -137,6 +174,14 @@ const toFetchable = (url) => {
 function hasType(node, type) {
   return [].concat(node?.["@type"] ?? []).includes(type);
 }
+
+/**
+ * What a JSON-LD property points at, one value or a list: plain strings (a
+ * sameAs URL) as they are, nodes by their @id. A node without an @id counts
+ * for nothing, so a join cannot pass on a name alone.
+ */
+const ids = (value) =>
+  [].concat(value ?? []).map((v) => (typeof v === "string" ? v : v?.["@id"] ?? "")).filter(Boolean);
 
 async function get(url, { ua = CRAWLERS[0].ua, redirect = "follow" } = {}) {
   const res = await fetch(toFetchable(url), {
@@ -178,6 +223,9 @@ const attr = (tag, name) => {
 };
 
 const tagsIn = (html, name) => [...html.matchAll(new RegExp(`<${name}\\b[^>]*>`, "gi"))].map((m) => m[0]);
+
+/** The text of the <title> in a head, or "" when there is none. */
+const titleOf = (head) => head.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? "";
 
 /** The href of <link rel="canonical"> in a head, or "" when there is none. */
 const canonicalOf = (head) => {
@@ -271,6 +319,28 @@ function robotsAllows(robotsTxt, token, path = "/") {
 const results = [];
 const record = (site, level, check, detail = "") => results.push({ site, level, check, detail });
 
+/**
+ * Fetch one page as one crawler and judge it the way that crawler would: it
+ * answers 200 on the expected origin, it is HTML, nothing tells this crawler
+ * not to index it (X-Robots-Tag or meta robots, its own token included), and
+ * it has a <title> in <head>. Returns { problem } or { head, body, title }.
+ * A network error is thrown, so the caller can tell "down" from "wrong".
+ */
+async function crawlPage(url, crawler, expectOrigin) {
+  const { res, body, type } = await get(url, { ua: crawler.ua });
+  if (!res.ok) return { problem: `HTTP ${res.status}` };
+  if (new URL(res.url).origin !== expectOrigin) return { problem: `redirected off the site: ended on ${res.url}` };
+  if (!type.includes("text/html")) return { problem: `content-type ${type || "none"}` };
+  const xRobots = res.headers.get("x-robots-tag") ?? "";
+  if (blocksIndex(xRobots, crawler.token)) return { problem: `X-Robots-Tag: ${xRobots}` };
+  const head = headOf(body);
+  const robotsMeta = metaRobots(head, crawler.token);
+  if (blocksIndex(robotsMeta, crawler.token)) return { problem: `meta robots: ${robotsMeta}` };
+  const title = titleOf(head);
+  if (!title) return { problem: "no <title> in <head> (a crawler that does not run JavaScript sees an untitled page)" };
+  return { head, body, title };
+}
+
 async function checkSite(site) {
   const { host } = site;
   const home = `https://${host}/`;
@@ -286,33 +356,9 @@ async function checkSite(site) {
   let unreachable = 0;
   for (const c of CRAWLERS) {
     try {
-      const { res, body, type } = await get(home, { ua: c.ua });
-      if (!res.ok) {
-        record(host, "FAIL", `home as ${c.token}`, `HTTP ${res.status}`);
-        continue;
-      }
-      if (new URL(res.url).origin !== homeOrigin) {
-        record(host, "FAIL", `home as ${c.token}`, `redirected off the site: ended on ${res.url}`);
-        continue;
-      }
-      if (!type.includes("text/html")) {
-        record(host, "FAIL", `home as ${c.token}`, `content-type ${type}`);
-        continue;
-      }
-      const xRobots = res.headers.get("x-robots-tag") ?? "";
-      if (blocksIndex(xRobots, c.token)) {
-        record(host, "FAIL", `home as ${c.token}`, `X-Robots-Tag: ${xRobots}`);
-        continue;
-      }
-      const head = headOf(body);
-      const robotsMeta = metaRobots(head, c.token);
-      if (blocksIndex(robotsMeta, c.token)) {
-        record(host, "FAIL", `home as ${c.token}`, `meta robots: ${robotsMeta}`);
-        continue;
-      }
-      const title = head.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? "";
-      if (!title) {
-        record(host, "FAIL", `home as ${c.token}`, "no <title> in <head> (a crawler that does not run JavaScript sees an untitled page)");
+      const { problem, head, body, title } = await crawlPage(home, c, homeOrigin);
+      if (problem) {
+        record(host, "FAIL", `home as ${c.token}`, problem);
         continue;
       }
       if (!title.includes(site.titleIncludes)) {
@@ -370,6 +416,33 @@ async function checkSite(site) {
     }
   }
 
+  // 2b. The pages that answer "who is Ibrahim Shareef", fetched as every
+  // crawler (the sitemap sample below fetches as Googlebot only): each must
+  // answer, be indexable, be titled in <head> and name itself as canonical.
+  for (const path of site.keyPages ?? []) {
+    const url = new URL(path, home).href;
+    const problems = [];
+    let head = "";
+    for (const c of CRAWLERS) {
+      try {
+        const page = await crawlPage(url, c, homeOrigin);
+        if (page.problem) problems.push(`${c.token}: ${page.problem}`);
+        else if (!page.title.includes(site.titleIncludes)) problems.push(`${c.token}: title "${page.title}" lacks "${site.titleIncludes}"`);
+        else head ||= page.head;
+      } catch (e) {
+        problems.push(`${c.token}: unreachable: ${why(e)}`);
+      }
+    }
+    if (head) {
+      // An empty href would resolve to the page itself, so it is checked first.
+      const canonical = canonicalOf(head);
+      if (!canonical) problems.push("no <link rel=canonical>");
+      else if (resolveUrl(canonical, url) !== url) problems.push(`canonical -> ${canonical}`);
+    }
+    record(host, problems.length ? "FAIL" : "PASS", `${path} as every crawler`,
+      problems.length ? problems.join("; ") : `${CRAWLERS.length} crawlers: 200, indexable, titled in <head>, self-canonical`);
+  }
+
   // 3. robots.txt: a real robots file that lets every crawler we care about in.
   let sitemapUrls = [];
   let robotsTxt = null;
@@ -407,7 +480,10 @@ async function checkSite(site) {
       return "";
     }
   };
-  const locsIn = (xml) => [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1]);
+  // A <loc> is XML text: "&" in a URL is written "&amp;".
+  const locsIn = (xml) =>
+    [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) =>
+      m[1].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&"));
   const found = [];
   const lastmods = new Set();
   for (const sm of sitemapUrls.length ? sitemapUrls : [`https://${host}/sitemap.xml`]) {
@@ -448,6 +524,9 @@ async function checkSite(site) {
   const offset = Math.floor(Date.now() / 86_400_000) % step;
   const sample = pages.filter((_, i) => i % step === offset).slice(0, SITEMAP_SAMPLE);
   const broken = [];
+  // Pages without a canonical on a site that gives every page one. Not a
+  // block, so a WARN; a canonical pointing elsewhere misleads, so a FAIL.
+  const noCanonical = [];
   let uncanonical = 0;
   for (const url of sample) {
     const path = new URL(url).pathname;
@@ -457,15 +536,27 @@ async function checkSite(site) {
         broken.push(`${path} -> ${res.status}`);
         continue;
       }
+      // A sitemap lists pages: a 200 that is JSON, a file or an untitled
+      // document is not one, whatever its status says.
+      const type = res.headers.get("content-type") ?? "";
+      if (!type.includes("text/html")) {
+        broken.push(`${path} is ${type || "no content-type"}, not an HTML page`);
+        continue;
+      }
       const head = headOf(await res.text());
+      if (!titleOf(head)) broken.push(`${path} has no <title> in <head>`);
       // Indexable for every checked crawler, as on the home page: a
       // "bingbot" meta or a "gptbot: noindex" header hides a page too.
       const xRobots = res.headers.get("x-robots-tag") ?? "";
       const noindexFor = CRAWLERS.filter((c) => blocksIndex(xRobots, c.token) || blocksIndex(metaRobots(head, c.token), c.token)).map((c) => c.token);
       if (noindexFor.length) broken.push(`${path} is noindex for ${noindexFor.join(", ")}`);
       const canonical = canonicalOf(head);
-      if (!canonical) uncanonical++;
-      else if (resolveUrl(canonical, url) !== resolveUrl(url)) broken.push(`${path} canonical -> ${canonical}`);
+      if (!canonical) {
+        uncanonical++;
+        if (site.homeCanonical !== false) noCanonical.push(path);
+      } else if (resolveUrl(canonical, url) !== resolveUrl(url)) {
+        broken.push(`${path} canonical -> ${canonical}`);
+      }
     } catch (e) {
       broken.push(`${path}: ${why(e)}`);
     }
@@ -478,7 +569,10 @@ async function checkSite(site) {
     record(host, broken.length ? "FAIL" : "PASS", "sitemap URLs",
       broken.length
         ? broken.join("; ")
-        : `${sample.length} of ${pages.length} sampled (slice ${offset + 1} of ${step}): all 200, indexable, ${canonicals}`);
+        : `${sample.length} of ${pages.length} sampled (slice ${offset + 1} of ${step}): all 200 HTML, titled, indexable, ${canonicals}`);
+    if (noCanonical.length) {
+      record(host, "WARN", "sitemap canonicals", `no <link rel=canonical> on ${noCanonical.join(", ")}`);
+    }
   }
 
   // 5. llms.txt and the IndexNow key.
@@ -537,11 +631,16 @@ async function checkSite(site) {
   }
 
   // 7. Optional: tell IndexNow about every URL. Fails closed without a live
-  // key, and never announces a local build or URLs that just failed. Only
-  // this host's URLs go in: one foreign URL makes IndexNow reject the batch.
+  // key, and never announces a local build, a site with any failing check
+  // (a robots block, a broken sitemap, a misrouted host), or URLs that just
+  // failed. Only this host's URLs go in: one foreign URL makes IndexNow
+  // reject the batch.
   if (process.env.SUBMIT_INDEXNOW === "true" && !localVsLive(host, new URL(INDEXNOW_ENDPOINT).host)) {
     const urlList = pages.slice(0, 10_000);
-    if (!keyLive) {
+    const siteFails = results.filter((r) => r.site === host && r.level === "FAIL").length;
+    if (siteFails) {
+      record(host, "WARN", "IndexNow submit", `skipped: ${siteFails} failing check(s) on this site`);
+    } else if (!keyLive) {
       record(host, "WARN", "IndexNow submit", "skipped: key file is not live");
     } else if (!urlList.length) {
       record(host, "WARN", "IndexNow submit", `skipped: no sitemap URLs on https://${host}`);
@@ -582,11 +681,13 @@ async function checkSite(site) {
 /**
  * A released episode with no /podcast/<number>-<slug> page on shareefi.co is
  * invisible to search and AI answers, and it is another absence nobody checks.
- * Match each of Apple's newest episodes to a page in the live sitemap by its
- * episode number ("EP44 - ..." on Apple, /podcast/44-... on the site), and
- * warn once one has been out on Apple for PODCAST_MAX_LAG_DAYS, counted from
- * its own release, with no page. Dates cannot be compared instead: the site
- * dates an episode by its YouTube release, weeks away from Apple's.
+ * Match every episode Apple lists (all of them, not only the newest: a page
+ * missing since 2025 is as missing as last week's) to a page in the live
+ * sitemap by its episode number ("EP44 - ..." on Apple, /podcast/44-... on the
+ * site), and warn once one has been out on Apple for PODCAST_MAX_LAG_DAYS,
+ * counted from its own release, with no page, unless EPISODES_WITHOUT_PAGE
+ * names it. Dates cannot be compared instead: the site dates an episode by its
+ * YouTube release, weeks away from Apple's.
  */
 async function checkPodcastFreshness() {
   const check = "podcast freshness";
@@ -611,8 +712,10 @@ async function checkPodcastFreshness() {
     if (!pageNumbers.size) throw new Error("no /podcast/<number>-<slug> URL");
 
     stage = "Apple lookup";
+    // 200 is the lookup API's maximum. Past that the oldest drop off the end,
+    // and the check says how many it read.
     const { res, body } = await get(
-      `https://itunes.apple.com/lookup?id=${PODCAST_APPLE_ID}&media=podcast&entity=podcastEpisode&limit=10`,
+      `https://itunes.apple.com/lookup?id=${PODCAST_APPLE_ID}&media=podcast&entity=podcastEpisode&limit=200`,
       { ua: "visibility-check" },
     );
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -636,20 +739,28 @@ async function checkPodcastFreshness() {
       return;
     }
     const cutoff = Date.now() - PODCAST_MAX_LAG_DAYS * 86_400_000;
-    const missing = released.filter((e) => e.number !== null && !pageNumbers.has(e.number));
+    // Every numbered episode Apple lists should have a page, bar the named exceptions.
+    const expected = released.filter((e) => e.number !== null && !EPISODES_WITHOUT_PAGE.has(e.number));
+    const missing = expected.filter((e) => !pageNumbers.has(e.number));
     const overdue = missing.filter((e) => e.releasedAt <= cutoff);
-    const scope = unnumbered.length
-      ? `the ${released.length - unnumbered.length} numbered episodes among Apple's ${released.length} newest`
-      : `Apple's ${released.length} newest episodes`;
+    const scope = `${expected.length - missing.length} of the ${expected.length} episodes that should have a page (Apple lists ${released.length})`;
     const unchecked = unnumbered.length ? `; ${unnumbered.length} without an episode number not checked: ${list(unnumbered)}` : "";
+    const excused = [...EPISODES_WITHOUT_PAGE].filter(([n]) => !pageNumbers.has(n));
+    const byDesign = excused.length ? `; no page by design: ${excused.map(([n, reason]) => `EP${n} (${reason})`).join(", ")}` : "";
+    // An exception whose episode now has a page would hide nothing today, but
+    // it is stale, and a stale exception is how the next gap goes unseen.
+    const stale = [...EPISODES_WITHOUT_PAGE.keys()].filter((n) => pageNumbers.has(n));
+    if (stale.length) {
+      record("shareefi.co", "WARN", check, `EPISODES_WITHOUT_PAGE lists ${stale.map((n) => `EP${n}`).join(", ")}, which now has a page: remove the entry`);
+    }
     if (overdue.length) {
       record("shareefi.co", "WARN", check,
         `out on Apple for over ${PODCAST_MAX_LAG_DAYS} days with no /podcast/<number>- page, newest first: ${list(overdue)}${unchecked}`);
     } else {
       record("shareefi.co", "PASS", check,
         (missing.length
-          ? `${scope}: ${missing.length} with no page yet, inside the ${PODCAST_MAX_LAG_DAYS}-day grace from release: ${list(missing)}`
-          : `${scope} all have a page`) + unchecked);
+          ? `${scope} have one; ${missing.length} not yet, inside the ${PODCAST_MAX_LAG_DAYS}-day grace from release: ${list(missing)}`
+          : `${scope} have one`) + byDesign + unchecked);
     }
   } catch (e) {
     // Never pass on a failed lookup: a flake that hides a missing page is the
@@ -700,5 +811,8 @@ console.log(markdown);
 // The step summary renders HTML, so "no <link rel=canonical>" would lose its
 // tag there; escape it. The log keeps the plain text.
 if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown.replace(/</g, "&lt;") + "\n");
+// The workflow puts this report in a GitHub issue when the run fails (issues
+// render markdown the same way, so the same escaping).
+if (process.env.VISIBILITY_REPORT) writeFileSync(process.env.VISIBILITY_REPORT, markdown.replace(/</g, "&lt;") + "\n");
 
 process.exit(fails || unaccepted ? 1 : 0);

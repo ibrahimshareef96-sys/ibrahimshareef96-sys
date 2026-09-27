@@ -27,20 +27,79 @@ jobs:
     # (it is skipped once every home fetch fails), a slow one a few minutes.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Crawl the live sites the way search and AI crawlers do
         run: node scripts/visibility-check.mjs
         env:
           SUBMIT_INDEXNOW: ${{ inputs.submit_indexnow && 'true' || 'false' }}
+          VISIBILITY_REPORT: ${{ runner.temp }}/visibility-report.md
+      - name: Keep the report for the issue job
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: visibility-report
+          path: ${{ runner.temp }}/visibility-report.md
+          retention-days: 7
+          if-no-files-found: ignore
+
+  issue:
+    # A failing scheduled or manual run opens a "Visibility check failing"
+    # issue, or comments on the open one, and the next passing run closes it.
+    # GitHub's own failure email goes to whoever last edited the schedule; an
+    # issue reaches the repository owner and stays open until the sites are
+    # fixed. Push runs are edits to this check: whoever pushed sees the result.
+    # Its own job, so only this job can write issues and the crawl cannot.
+    needs: check
+    if: always() && github.event_name != 'push' && needs.check.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Fetch the report
+        if: needs.check.result != 'success'
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: visibility-report
+          path: report
+      - name: Open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RESULT: ${{ needs.check.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Visibility check failing"
+          open=$(gh issue list --state open --search "\"$title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ "$RESULT" = "success" ]; then
+            if [ -n "$open" ]; then gh issue close "$open" --comment "Passing again: $RUN_URL"; fi
+            exit 0
+          fi
+          if [ -s report/visibility-report.md ]; then
+            report=$(cat report/visibility-report.md)
+          else
+            report="The check ended as \"$RESULT\" without writing a report (it crashed, timed out or was cancelled). The run log has the details."
+          fi
+          # An issue body holds 65,536 characters.
+          body=$(printf '%s\n\n%s' "$RUN_URL" "$report" | head -c 60000)
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
 
   keepalive:
     # GitHub disables the schedule of a public repo after 60 days without a
     # commit, silently: no failed run, no email. Re-enabling the workflow
-    # through the API resets that clock without a dummy commit. Only this job
-    # gets actions: write; the check job keeps contents: read.
+    # through the API is the usual way to reset that clock without a dummy
+    # commit, but GitHub does not document that it does, so treat this as
+    # best effort. It cannot notice the schedule stopping either: a job that
+    # never runs reports nothing. Only this job gets actions: write.
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 5
