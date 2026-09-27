@@ -56,11 +56,11 @@ const SITES = [
     keyPages: ["/about"],
     indexNowKey: "d0e9e916ece615af996965b082904092",
     entity: (nodes) => {
-      const person = nodes.find((n) => hasType(n, "Person") && n["@id"] === PERSON_ID);
-      if (!person || person.name !== "Ibrahim Shareef") return `no Person node ${PERSON_ID} named "Ibrahim Shareef"`;
+      const person = entityById(nodes, PERSON_ID, "Person");
+      if (!person?.name?.includes("Ibrahim Shareef")) return `no Person node ${PERSON_ID} named "Ibrahim Shareef"`;
       if (!ids(person.sameAs).includes(LINKEDIN)) return `Person.sameAs lacks his LinkedIn (${LINKEDIN})`;
       if (!ids(person.worksFor).includes(ORG_ID)) return `Person.worksFor does not point at ${ORG_ID}`;
-      const org = nodes.find((n) => hasType(n, "Organization") && n["@id"] === ORG_ID);
+      const org = entityById(nodes, ORG_ID, "Organization");
       if (!org || !ids(org.founder).includes(PERSON_ID)) return `no Organization ${ORG_ID} whose founder includes ${PERSON_ID}`;
       return true;
     },
@@ -72,11 +72,11 @@ const SITES = [
     keyPages: ["/about"],
     indexNowKey: "6bd42839add7a68fecb11bc425290ad5",
     entity: (nodes) => {
-      const org = nodes.find((n) => hasType(n, "Organization") && n["@id"] === ORG_ID);
+      const org = entityById(nodes, ORG_ID, "Organization");
       if (!org) return `no Organization node ${ORG_ID}`;
       if (!ids(org.founder).includes(PERSON_ID)) return `Organization.founder does not include ${PERSON_ID}`;
-      const person = nodes.find((n) => hasType(n, "Person") && n["@id"] === PERSON_ID);
-      if (!person || person.name !== "Ibrahim Shareef") return `no Person node ${PERSON_ID} named "Ibrahim Shareef"`;
+      const person = entityById(nodes, PERSON_ID, "Person");
+      if (!person?.name?.includes("Ibrahim Shareef")) return `no Person node ${PERSON_ID} named "Ibrahim Shareef"`;
       if (!ids(person.sameAs).some((u) => u.startsWith("https://shareefi.co"))) return "the founder Person does not link to shareefi.co in sameAs";
       return true;
     },
@@ -91,10 +91,10 @@ const SITES = [
     keyPages: [],
     indexNowKey: "bdbc493db1edca63208e9dd953eb5dd7",
     entity: (nodes) => {
-      const app = nodes.find((n) => hasType(n, "WebApplication") || hasType(n, "SoftwareApplication"));
-      if (!app) return "no WebApplication node";
-      if (!ids(app.creator).includes(PERSON_ID)) return `the app's creator is not ${PERSON_ID}`;
-      if (!ids(app.publisher).includes(ORG_ID)) return `the app's publisher is not ${ORG_ID}`;
+      const apps = nodes.filter((n) => hasType(n, "WebApplication") || hasType(n, "SoftwareApplication"));
+      if (!apps.length) return "no WebApplication node";
+      if (!apps.some((a) => ids(a.creator).includes(PERSON_ID))) return `the app's creator is not ${PERSON_ID}`;
+      if (!apps.some((a) => ids(a.publisher).includes(ORG_ID))) return `the app's publisher is not ${ORG_ID}`;
       return true;
     },
   },
@@ -141,6 +141,11 @@ const PODCAST_MAX_LAG_DAYS = 7;
 const EPISODES_WITHOUT_PAGE = new Map([
   [12, "audio only: released on Apple and Spotify, never on YouTube"],
 ]);
+// Apple episodes with no number in the title (a trailer, a bonus) cannot be
+// matched to a /podcast/<number>- page, so each one warns once past the grace
+// period until its Apple id (trackId) is listed here with the reason, or the
+// title gets its number. Empty: every episode so far is numbered.
+const UNNUMBERED_WITHOUT_PAGE = new Map([]);
 
 /**
  * Warnings that do not fail the run: a check name, why its warning is
@@ -216,10 +221,23 @@ const resolveUrl = (href, base) => {
 const why = (e) =>
   e?.cause ? `${e.message} (${String(e.cause.code ?? e.cause.message).trim()})` : String(e?.message ?? e);
 
-/** The value of one attribute in one HTML tag (any quoting, any order), or undefined. */
+/**
+ * Markup text as the parser reads it: HTML attribute values and XML <loc>
+ * values write "&" as "&amp;". Decoded on both sides, a sitemap URL and a
+ * canonical compare as the same URL. "&amp;" goes last, so "&amp;lt;" stays "&lt;".
+ */
+const decodeEntities = (s) =>
+  s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&(?:apos|#0*39|#x0*27);/gi, "'")
+    .replace(/&amp;/g, "&");
+
+/** The value of one attribute in one HTML tag (any quoting, any order), decoded, or undefined. */
 const attr = (tag, name) => {
   const m = tag.match(new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, "i"));
-  return m ? (m[1] ?? m[2] ?? m[3]) : undefined;
+  return m ? decodeEntities(m[1] ?? m[2] ?? m[3]) : undefined;
 };
 
 const tagsIn = (html, name) => [...html.matchAll(new RegExp(`<${name}\\b[^>]*>`, "gi"))].map((m) => m[0]);
@@ -262,18 +280,45 @@ function blocksIndex(directives, token) {
   return false;
 }
 
+/**
+ * Every typed node in the page's JSON-LD, nested ones included: a Person's
+ * worksFor may be a whole Organization node rather than a reference to one.
+ */
 function jsonLdNodes(html) {
   const nodes = [];
   const errors = [];
+  const collect = (value) => {
+    if (Array.isArray(value)) return value.forEach(collect);
+    if (!value || typeof value !== "object") return;
+    if (value["@type"]) nodes.push(value);
+    for (const [key, child] of Object.entries(value)) if (key !== "@context") collect(child);
+  };
   for (const m of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
     try {
-      const doc = JSON.parse(m[1]);
-      for (const d of [].concat(doc)) nodes.push(...(d["@graph"] ?? [d]));
+      collect(JSON.parse(m[1]));
     } catch (e) {
       errors.push(e.message);
     }
   }
   return { nodes, errors };
+}
+
+/**
+ * One entity as JSON-LD sees it: every node of this type with this @id is the
+ * same thing, so their properties add up (a full node on the page and a
+ * nested copy under someone's worksFor). Each property comes back as a list.
+ * null when no node has the @id.
+ */
+function entityById(nodes, id, type) {
+  const parts = nodes.filter((n) => n["@id"] === id && hasType(n, type));
+  if (!parts.length) return null;
+  // No prototype: the keys come from remote JSON, and a "__proto__" key must
+  // stay an ordinary property.
+  const merged = Object.create(null);
+  for (const part of parts) {
+    for (const [key, value] of Object.entries(part)) merged[key] = [...(merged[key] ?? []), ...[].concat(value)];
+  }
+  return merged;
 }
 
 /**
@@ -422,22 +467,22 @@ async function checkSite(site) {
   for (const path of site.keyPages ?? []) {
     const url = new URL(path, home).href;
     const problems = [];
-    let head = "";
     for (const c of CRAWLERS) {
       try {
         const page = await crawlPage(url, c, homeOrigin);
-        if (page.problem) problems.push(`${c.token}: ${page.problem}`);
-        else if (!page.title.includes(site.titleIncludes)) problems.push(`${c.token}: title "${page.title}" lacks "${site.titleIncludes}"`);
-        else head ||= page.head;
+        if (page.problem) {
+          problems.push(`${c.token}: ${page.problem}`);
+          continue;
+        }
+        if (!page.title.includes(site.titleIncludes)) problems.push(`${c.token}: title "${page.title}" lacks "${site.titleIncludes}"`);
+        // Each crawler's own copy: a user-agent switch can serve another head.
+        // An empty href would resolve to the page itself, so it is checked first.
+        const canonical = canonicalOf(page.head);
+        if (!canonical) problems.push(`${c.token}: no <link rel=canonical>`);
+        else if (resolveUrl(canonical, url) !== url) problems.push(`${c.token}: canonical -> ${canonical}`);
       } catch (e) {
         problems.push(`${c.token}: unreachable: ${why(e)}`);
       }
-    }
-    if (head) {
-      // An empty href would resolve to the page itself, so it is checked first.
-      const canonical = canonicalOf(head);
-      if (!canonical) problems.push("no <link rel=canonical>");
-      else if (resolveUrl(canonical, url) !== url) problems.push(`canonical -> ${canonical}`);
     }
     record(host, problems.length ? "FAIL" : "PASS", `${path} as every crawler`,
       problems.length ? problems.join("; ") : `${CRAWLERS.length} crawlers: 200, indexable, titled in <head>, self-canonical`);
@@ -461,6 +506,13 @@ async function checkSite(site) {
   } catch (e) {
     record(host, "FAIL", "robots.txt", `unreachable: ${why(e)}`);
   }
+  // The key pages must be fetchable too, whether or not a sitemap lists them.
+  if (robotsTxt !== null) {
+    for (const path of site.keyPages ?? []) {
+      const blocked = CRAWLERS.filter((c) => !robotsAllows(robotsTxt, c.token, path)).map((c) => c.token);
+      if (blocked.length) record(host, "FAIL", "robots.txt", `blocks ${path} for ${blocked.join(", ")}`);
+    }
+  }
 
   // 4. Sitemap: every sitemap file (and every child of a sitemap index) is XML
   // served from this host, and together they list page URLs on this host that
@@ -481,9 +533,7 @@ async function checkSite(site) {
     }
   };
   // A <loc> is XML text: "&" in a URL is written "&amp;".
-  const locsIn = (xml) =>
-    [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) =>
-      m[1].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&"));
+  const locsIn = (xml) => [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => decodeEntities(m[1]));
   const found = [];
   const lastmods = new Set();
   for (const sm of sitemapUrls.length ? sitemapUrls : [`https://${host}/sitemap.xml`]) {
@@ -723,6 +773,7 @@ async function checkPodcastFreshness() {
       .filter((r) => (r.kind === "podcast-episode" || r.wrapperType === "podcastEpisode") && r.releaseDate)
       .sort((a, b) => b.releaseDate.localeCompare(a.releaseDate))
       .map((r) => ({
+        id: String(r.trackId ?? ""),
         title: r.trackName,
         date: r.releaseDate.slice(0, 10),
         releasedAt: Date.parse(r.releaseDate),
@@ -745,6 +796,15 @@ async function checkPodcastFreshness() {
     const overdue = missing.filter((e) => e.releasedAt <= cutoff);
     const scope = `${expected.length - missing.length} of the ${expected.length} episodes that should have a page (Apple lists ${released.length})`;
     const unchecked = unnumbered.length ? `; ${unnumbered.length} without an episode number not checked: ${list(unnumbered)}` : "";
+    // An unnumbered episode can never be matched to a page, so past the grace
+    // period it warns (listing it in a PASS row would let it hide for good).
+    const unnumberedOverdue = unnumbered.filter((e) => e.releasedAt <= cutoff && !UNNUMBERED_WITHOUT_PAGE.has(e.id));
+    if (unnumberedOverdue.length) {
+      record("shareefi.co", "WARN", check,
+        `no episode number in the Apple title, so no page can be matched, out over ${PODCAST_MAX_LAG_DAYS} days: ` +
+        `${unnumberedOverdue.map((e) => `${e.date} "${e.title}" (Apple id ${e.id})`).join("; ")}. ` +
+        "Number it on Apple, or add its Apple id to UNNUMBERED_WITHOUT_PAGE with the reason");
+    }
     const excused = [...EPISODES_WITHOUT_PAGE].filter(([n]) => !pageNumbers.has(n));
     const byDesign = excused.length ? `; no page by design: ${excused.map(([n, reason]) => `EP${n} (${reason})`).join(", ")}` : "";
     // An exception whose episode now has a page would hide nothing today, but
@@ -789,8 +849,22 @@ const summary = `${fails} failing, ${warns} warnings (${unaccepted} not accepted
 
 const ICON = { PASS: "✅", WARN: "⚠️", FAIL: "❌" };
 // One table row per result: a newline in a detail (a multi-line <title>, an
-// episode title, a rejection body) would split the row.
-const cell = (s) => String(s).replace(/\s*\n\s*/g, " ").replace(/\|/g, "\\|");
+// episode title, a rejection body) would split the row. Details quote what the
+// sites and Apple sent (titles, URLs, headers), so each is capped in length.
+const CELL_MAX = 500;
+const cell = (s) => {
+  const flat = String(s).replace(/\s*\n\s*/g, " ").replace(/\|/g, "\\|");
+  return flat.length > CELL_MAX ? `${flat.slice(0, CELL_MAX - 1)}…` : flat;
+};
+/**
+ * The report as GitHub renders it (the step summary and the failure issue in
+ * this public repo): quoted remote text must stay inert. "<" is escaped so a
+ * tag shows as text, "@" gets a zero-width space so a name in a page title
+ * pings nobody, and "](" and "![" are broken so it cannot become a link or an
+ * image. The log keeps the plain text.
+ */
+const rendered = (md) =>
+  md.replace(/</g, "&lt;").replace(/@/g, "@​").replace(/\]\(/g, "]​(").replace(/!\[/g, "!​[");
 const lines = [
   "## Visibility check",
   "",
@@ -808,11 +882,8 @@ const lines = [
 ];
 const markdown = lines.join("\n");
 console.log(markdown);
-// The step summary renders HTML, so "no <link rel=canonical>" would lose its
-// tag there; escape it. The log keeps the plain text.
-if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown.replace(/</g, "&lt;") + "\n");
-// The workflow puts this report in a GitHub issue when the run fails (issues
-// render markdown the same way, so the same escaping).
-if (process.env.VISIBILITY_REPORT) writeFileSync(process.env.VISIBILITY_REPORT, markdown.replace(/</g, "&lt;") + "\n");
+if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, rendered(markdown) + "\n");
+// The workflow files this report as a GitHub issue when the run fails.
+if (process.env.VISIBILITY_REPORT) writeFileSync(process.env.VISIBILITY_REPORT, rendered(markdown) + "\n");
 
 process.exit(fails || unaccepted ? 1 : 0);

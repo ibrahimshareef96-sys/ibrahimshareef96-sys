@@ -20,6 +20,13 @@ on:
 permissions:
   contents: read
 
+# One run at a time, in the order they started: a manual run and the
+# scheduled one must not both open an issue, and an older passing run must
+# never close the issue a newer failing run opened.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -85,8 +92,11 @@ jobs:
           else
             report="The check ended as \"$RESULT\" without writing a report (it crashed, timed out or was cancelled). The run log has the details."
           fi
-          # An issue body holds 65,536 characters.
-          body=$(printf '%s\n\n%s' "$RUN_URL" "$report" | head -c 60000)
+          # An issue body holds 65,536 characters. Cut by bytes, then drop a
+          # character the cut may have split (the report has emoji and Arabic),
+          # since GitHub rejects a body that is not valid UTF-8. iconv -c exits
+          # non-zero when it drops one; its output is still the body we want.
+          body=$( { printf '%s\n\n%s' "$RUN_URL" "$report" | head -c 60000 | iconv -c -f UTF-8 -t UTF-8; } || true )
           if [ -n "$open" ]; then
             gh issue comment "$open" --body "$body"
           else
