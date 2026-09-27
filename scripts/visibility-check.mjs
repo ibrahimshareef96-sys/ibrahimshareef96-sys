@@ -122,7 +122,7 @@ const CRAWLERS = [
 ];
 
 const SITEMAP_SAMPLE = 12;
-// Per request. Requests run one after another (about 25 per site), so this
+// Per request. Requests run one after another (about 40 per site), so this
 // bounds even a slow site at a few minutes, inside the workflow's timeout.
 const TIMEOUT_MS = 10_000;
 

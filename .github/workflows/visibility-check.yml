@@ -30,9 +30,10 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # 10s per request, one after another: a wedged site costs about a minute
-    # (it is skipped once every home fetch fails), a slow one a few minutes.
-    timeout-minutes: 15
+    # 10s per request, one after another, about 40 per site: a wedged site
+    # costs under two minutes (it is skipped once every home fetch fails), a
+    # slow one up to seven, so three slow sites still finish with a report.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
