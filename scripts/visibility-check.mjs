@@ -524,8 +524,20 @@ async function checkSite(site) {
     try {
       if (!onHost(url)) throw new Error(`not on https://${host}`);
       const { res, body, type } = await get(url);
-      if (res.ok && /xml/.test(type)) return body;
-      throw new Error(`HTTP ${res.status}, ${type || "no content-type"}`);
+      if (!res.ok || !/xml/.test(type)) throw new Error(`HTTP ${res.status}, ${type || "no content-type"}`);
+      // Not a full XML parse: the two faults that can make a search engine
+      // reject the whole file while <loc> matching still finds URLs in it, a
+      // cut-off document and a bare "&". Comments and CDATA may hold either.
+      // Its URLs are still checked below, so one fault does not hide others.
+      const xml = body.replace(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>/g, "");
+      const fault = !/<\/(urlset|sitemapindex)\s*>/i.test(xml) ? "no closing </urlset> or </sitemapindex> (cut off?)"
+        : /&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[\da-f]+);)/i.test(xml) ? 'a bare "&" (not well-formed XML)'
+        : "";
+      if (fault) {
+        sitemapsOk = false;
+        record(host, "FAIL", "sitemap", `${url}: ${fault}; search engines may reject the file`);
+      }
+      return body;
     } catch (e) {
       sitemapsOk = false;
       record(host, "FAIL", "sitemap", `${url}: ${why(e)}`);
